@@ -1655,6 +1655,7 @@ int reord_single_frame_ind(struct aicwf_rx_priv *rx_priv, struct recv_msdu *prfr
 
 	if (skb == NULL) {
 		txrx_err("skb is NULL\n");
+		reord_rxframe_free(&rx_priv->freeq_lock, rxframes_freequeue, &prframe->rxframe_list);
 		return -1;
 	}
 	
@@ -1840,6 +1841,15 @@ void reord_timeout_worker(struct work_struct *work)
     return ;
 }
 
+/* RTP over UDP over IPv4: late frames of it are of no use and go */
+static bool reord_rtp(struct sk_buff *skb)
+{
+	const u8 *data = skb->data;
+
+	return skb->len > 42 && data[12] == 0x08 && data[13] == 0x00 &&
+	       (data[14] & 0x0f) == 5 && data[23] == IPPROTO_UDP && data[42] == 0x80;
+}
+
 int reord_process_unit(struct aicwf_rx_priv *rx_priv, struct sk_buff *skb, u16 seq_num, u8 tid, u8 forward, u8 is_amsdu)
 {
 	int ret = 0;
@@ -1881,8 +1891,8 @@ int reord_process_unit(struct aicwf_rx_priv *rx_priv, struct sk_buff *skb, u16 s
 	else if ((rwnx_vif->wdev.iftype == NL80211_IFTYPE_AP) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_GO))
 		mac = eh->h_source;
 	else {
-		dev_kfree_skb(skb);
-		return -1;
+		ret = -1;
+		goto fail;
 	}
 
 	spin_lock_bh(&rx_priv->stas_reord_lock);
@@ -1897,8 +1907,8 @@ int reord_process_unit(struct aicwf_rx_priv *rx_priv, struct sk_buff *skb, u16 s
 		reord_info = reord_init_sta(rx_priv, mac);
 		if (!reord_info) {
 			spin_unlock_bh(&rx_priv->stas_reord_lock);
-			dev_kfree_skb(skb);
-			return -1;
+			ret = -1;
+			goto fail;
 		}
 		list_add_tail(&reord_info->list, &rx_priv->stas_reord_list);
 		preorder_ctrl = &reord_info->preorder_ctrl[pframe->tid];
@@ -1924,7 +1934,7 @@ int reord_process_unit(struct aicwf_rx_priv *rx_priv, struct sk_buff *skb, u16 s
     spin_lock_bh(&preorder_ctrl->reord_list_lock);
     if (reord_need_check(preorder_ctrl, pframe->seq_num)) {
 #if 1
-        if(pframe->rx_data[42] == 0x80){//this is rtp package
+        if (reord_rtp(skb)) {
             if(pframe->seq_num == preorder_ctrl->ind_sn){
                 printk("%s pframe->seq_num1:%d \r\n", __func__, pframe->seq_num);
                 reord_single_frame_ind(rx_priv, pframe);//not need to reorder
