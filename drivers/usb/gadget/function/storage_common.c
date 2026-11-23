@@ -545,12 +545,15 @@ ssize_t fsg_store_file(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 	if (count > 0 && buf[0]) {
 		/* fsg_lun_open() will close existing file if any. */
 		rc = fsg_lun_open(curlun, buf);
-		if (rc == 0)
+		if (rc == 0) {
 			curlun->unit_attention_data =
 					SS_NOT_READY_TO_READY_TRANSITION;
+			curlun->media_event = FSG_MEDIA_NEW;
+		}
 	} else if (fsg_lun_is_open(curlun)) {
 		fsg_lun_close(curlun);
 		curlun->unit_attention_data = SS_MEDIUM_NOT_PRESENT;
+		curlun->media_event = FSG_MEDIA_REMOVAL;
 	}
 	up_write(filesem);
 	return (rc < 0 ? rc : count);
@@ -736,6 +739,35 @@ ssize_t fsg_store_forced_eject(struct fsg_lun *curlun, struct rw_semaphore *file
 	return ret < 0 ? ret : count;
 }
 EXPORT_SYMBOL_GPL(fsg_store_forced_eject);
+
+/*
+ * As the eject button of an optical drive: the host is told, by GET EVENT
+ * STATUS NOTIFICATION, that the medium is to come out, and ejects it once
+ * it is done with it.
+ */
+ssize_t fsg_store_eject_request(struct fsg_lun *curlun,
+				struct rw_semaphore *filesem,
+				const char *buf, size_t count)
+{
+	bool		request;
+	ssize_t		ret;
+
+	ret = kstrtobool(buf, &request);
+	if (ret)
+		return ret;
+
+	down_write(filesem);
+	if (!curlun->cdrom)
+		ret = -EINVAL;
+	else if (!fsg_lun_is_open(curlun))
+		ret = -ENOMEDIUM;
+	else if (request)
+		curlun->media_event = FSG_MEDIA_EJECT_REQUEST;
+	up_write(filesem);
+
+	return ret < 0 ? ret : count;
+}
+EXPORT_SYMBOL_GPL(fsg_store_eject_request);
 
 MODULE_DESCRIPTION("Common definitions for mass storage functionality");
 MODULE_LICENSE("GPL");

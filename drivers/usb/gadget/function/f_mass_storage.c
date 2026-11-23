@@ -56,6 +56,9 @@
  *				index 1; where its first sector is in the
  *				file).  Set without a medium, before the file;
  *				ejecting the medium clears it.
+ *	->eject_request	For a CD-ROM LUN, as its eject button: the host
+ *				hears of it through GET EVENT STATUS
+ *				NOTIFICATION and ejects the medium.
  *	->nofua		Flag specifying that FUA flag in SCSI WRITE(10,12)
  *				commands for this LUN shall be ignored.
  *
@@ -1172,6 +1175,34 @@ static int fsg_cd_read_toc(struct fsg_common *common, struct fsg_buffhd *bh,
 	return p - buf;
 }
 
+/* GET EVENT STATUS NOTIFICATION, polled: the media events */
+static int do_get_event_status_notification(struct fsg_common *common,
+					    struct fsg_buffhd *bh)
+{
+	struct fsg_lun *curlun = common->curlun;
+	u8 *buf = (u8 *)bh->buf;
+
+	if (!(common->cmnd[1] & 0x01)) {	/* Polled only */
+		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+		return -EINVAL;
+	}
+
+	memset(buf, 0, 8);
+	buf[3] = 0x10;				/* Media events */
+	if (!(common->cmnd[4] & 0x10)) {
+		put_unaligned_be16(2, buf);
+		buf[2] = 0x80;			/* No event available */
+		return 4;
+	}
+
+	put_unaligned_be16(6, buf);
+	buf[2] = 0x04;				/* Media class */
+	buf[4] = curlun->media_event;
+	buf[5] = fsg_lun_is_open(curlun) ? 0x02 : 0;	/* Media present */
+	curlun->media_event = FSG_MEDIA_NO_CHANGE;
+	return 8;
+}
+
 /*
  * READ SUB-CHANNEL: where READ CD read last, with no audio playing; no
  * media catalog number nor ISRC. A medium without tracks is one data track.
@@ -1990,6 +2021,10 @@ static int do_get_configuration(struct fsg_common *common,
 	if (FSG_WANT(0x0001, true)) {		/* Core */
 		p = fsg_feature(p, 0x0001, 0, true, true, 4);
 		put_unaligned_be32(8, p);	/* Physical interface: USB */
+		p += 4;
+	}
+	if (FSG_WANT(0x0002, true)) {		/* Morphing: polled GESN */
+		p = fsg_feature(p, 0x0002, 1, true, true, 4);
 		p += 4;
 	}
 	if (FSG_WANT(0x0003, true)) {		/* Removable Medium */
@@ -3039,6 +3074,18 @@ static int do_scsi_command(struct fsg_common *common)
 				      "READ CD");
 		if (reply == 0)
 			reply = do_read_cd(common);
+		break;
+
+	case GPCMD_GET_EVENT_STATUS_NOTIFICATION:
+		if (!common->curlun || !common->curlun->cdrom)
+			goto unknown_cmnd;
+		common->data_size_from_cmnd =
+			get_unaligned_be16(&common->cmnd[7]);
+		reply = check_command(common, 10, DATA_DIR_TO_HOST,
+				      (1<<1) | (1<<4) | (3<<7), 0,
+				      "GET EVENT STATUS NOTIFICATION");
+		if (reply == 0)
+			reply = do_get_event_status_notification(common, bh);
 		break;
 
 	case GPCMD_READ_SUBCHANNEL:
@@ -4325,6 +4372,18 @@ static ssize_t fsg_lun_opts_tracks_store(struct config_item *item,
 
 CONFIGFS_ATTR(fsg_lun_opts_, tracks);
 
+static ssize_t fsg_lun_opts_eject_request_store(struct config_item *item,
+						const char *page, size_t len)
+{
+	struct fsg_lun_opts *opts = to_fsg_lun_opts(item);
+	struct fsg_opts *fsg_opts = to_fsg_opts(opts->group.cg_item.ci_parent);
+
+	return fsg_store_eject_request(opts->lun, &fsg_opts->common->filesem,
+				       page, len);
+}
+
+CONFIGFS_ATTR_WO(fsg_lun_opts_, eject_request);
+
 static ssize_t fsg_lun_opts_nofua_show(struct config_item *item, char *page)
 {
 	return fsg_show_nofua(to_fsg_lun_opts(item)->lun, page);
@@ -4371,6 +4430,7 @@ static struct configfs_attribute *fsg_lun_attrs[] = {
 	&fsg_lun_opts_attr_cdrom,
 	&fsg_lun_opts_attr_profile,
 	&fsg_lun_opts_attr_tracks,
+	&fsg_lun_opts_attr_eject_request,
 	&fsg_lun_opts_attr_nofua,
 	&fsg_lun_opts_attr_inquiry_string,
 	&fsg_lun_opts_attr_forced_eject,

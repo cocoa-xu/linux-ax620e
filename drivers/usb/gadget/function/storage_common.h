@@ -118,6 +118,14 @@ struct fsg_cd_track {
 
 #define FSG_CD_MAX_TRACKS	99
 
+/* A media event of an optical LUN, for GET EVENT STATUS NOTIFICATION */
+enum fsg_media_event {
+	FSG_MEDIA_NO_CHANGE,
+	FSG_MEDIA_EJECT_REQUEST,
+	FSG_MEDIA_NEW,
+	FSG_MEDIA_REMOVAL,
+};
+
 struct fsg_lun {
 	struct file	*filp;
 	loff_t		file_length;
@@ -127,6 +135,7 @@ struct fsg_lun {
 	struct fsg_cd_track *tracks;
 	unsigned int	num_tracks;
 	u32		cd_position;	/* For READ SUB-CHANNEL: what READ CD read last */
+	u8		media_event;	/* Not yet reported: enum fsg_media_event */
 
 	unsigned int	initially_ro:1;
 	unsigned int	ro:1;
@@ -268,5 +277,8 @@ ssize_t fsg_store_inquiry_string(struct fsg_lun *curlun, const char *buf,
 				 size_t count);
 ssize_t fsg_store_forced_eject(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 			       const char *buf, size_t count);
+ssize_t fsg_store_eject_request(struct fsg_lun *curlun,
+				struct rw_semaphore *filesem,
+				const char *buf, size_t count);
 
 #endif /* USB_STORAGE_COMMON_H */
