@@ -43,6 +43,10 @@
  *				being removable.
  *	->cdrom		Flag specifying that LUN shall be reported as
  *				being a CD-ROM.
+ *	->profile	For a CD-ROM LUN, the medium it reports: "cd"
+ *				(the default), "dvd" or "bd".  Set before
+ *				the file; a DVD or BD is not limited to the
+ *				CD's 255 minutes.
  *	->nofua		Flag specifying that FUA flag in SCSI WRITE(10,12)
  *				commands for this LUN shall be ignored.
  *
@@ -169,6 +173,7 @@
 /* #define DUMP_MSGS */
 
 #include <linux/blkdev.h>
+#include <linux/cdrom.h>
 #include <linux/completion.h>
 #include <linux/dcache.h>
 #include <linux/delay.h>
@@ -1274,6 +1279,251 @@ static int do_read_toc(struct fsg_common *common, struct fsg_buffhd *bh)
 	}
 }
 
+/* MMC profiles, and the sectors of a single-layer DVD */
+#define FSG_MMC_PROFILE_CD_ROM		0x0008
+#define FSG_MMC_PROFILE_DVD_ROM		0x0010
+#define FSG_MMC_PROFILE_BD_ROM		0x0040
+#define FSG_DVD_SL_SECTORS		2295104
+
+/* The current profile, or none without a medium */
+static u16 fsg_current_profile(struct fsg_lun *curlun)
+{
+	if (!fsg_lun_is_open(curlun))
+		return 0;
+
+	switch (curlun->profile) {
+	case FSG_PROFILE_DVD:
+		return FSG_MMC_PROFILE_DVD_ROM;
+	case FSG_PROFILE_BD:
+		return FSG_MMC_PROFILE_BD_ROM;
+	default:
+		return FSG_MMC_PROFILE_CD_ROM;
+	}
+}
+
+/* A feature descriptor's header; its data, zeroed, follows */
+static u8 *fsg_feature(u8 *p, u16 code, u8 version, bool persistent,
+		       bool is_current, u8 length)
+{
+	put_unaligned_be16(code, p);
+	p[2] = (version << 2) | (persistent << 1) | is_current;
+	p[3] = length;
+	memset(p + 4, 0, length);
+	return p + 4;
+}
+
+static int do_get_configuration(struct fsg_common *common,
+				struct fsg_buffhd *bh)
+{
+	static const u16 profiles[] = {
+		FSG_MMC_PROFILE_BD_ROM,
+		FSG_MMC_PROFILE_DVD_ROM,
+		FSG_MMC_PROFILE_CD_ROM,
+	};
+	struct fsg_lun	*curlun = common->curlun;
+	u8		*buf = (u8 *)bh->buf;
+	u8		*p = buf + 8;
+	int		rt = common->cmnd[1] & 0x03;
+	u16		start = get_unaligned_be16(&common->cmnd[2]);
+	u16		profile = fsg_current_profile(curlun);
+	int		i;
+
+	if (rt == 3) {
+		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+		return -EINVAL;
+	}
+
+	/* RT 0: all from start on, 1: the current ones, 2: start only */
+#define FSG_WANT(code, cur) \
+	(rt == 2 ? (code) == start : (code) >= start && (rt == 0 || (cur)))
+
+	memset(buf, 0, 8);
+
+	if (FSG_WANT(0x0000, true)) {		/* Profile List */
+		p = fsg_feature(p, 0x0000, 0, true, true,
+				4 * ARRAY_SIZE(profiles));
+		for (i = 0; i < ARRAY_SIZE(profiles); i++, p += 4) {
+			put_unaligned_be16(profiles[i], p);
+			p[2] = profiles[i] == profile;
+		}
+	}
+	if (FSG_WANT(0x0001, true)) {		/* Core */
+		p = fsg_feature(p, 0x0001, 0, true, true, 4);
+		put_unaligned_be32(8, p);	/* Physical interface: USB */
+		p += 4;
+	}
+	if (FSG_WANT(0x0003, true)) {		/* Removable Medium */
+		p = fsg_feature(p, 0x0003, 0, true, true, 4);
+		p[0] = (1 << 5) | (1 << 3) | (1 << 0);	/* Tray, eject, lock */
+		p += 4;
+	}
+	if (FSG_WANT(0x0010, profile != 0)) {	/* Random Readable */
+		p = fsg_feature(p, 0x0010, 0, false, profile != 0, 8);
+		put_unaligned_be32(2048, p);
+		put_unaligned_be16(profile == FSG_MMC_PROFILE_BD_ROM ? 32 :
+				   profile == FSG_MMC_PROFILE_DVD_ROM ? 16 : 1,
+				   p + 4);
+		p += 8;
+	}
+	if (FSG_WANT(0x001e, profile == FSG_MMC_PROFILE_CD_ROM)) { /* CD Read */
+		p = fsg_feature(p, 0x001e, 0, false,
+				profile == FSG_MMC_PROFILE_CD_ROM, 0);
+	}
+	if (FSG_WANT(0x001f, profile == FSG_MMC_PROFILE_DVD_ROM)) { /* DVD Read */
+		p = fsg_feature(p, 0x001f, 0, false,
+				profile == FSG_MMC_PROFILE_DVD_ROM, 0);
+	}
+	if (FSG_WANT(0x0040, profile == FSG_MMC_PROFILE_BD_ROM)) { /* BD Read */
+		p = fsg_feature(p, 0x0040, 0, false,
+				profile == FSG_MMC_PROFILE_BD_ROM, 28);
+		put_unaligned_be16(0xffff, p + 20);	/* BD-ROM, class 0 */
+		p += 28;
+	}
+#undef FSG_WANT
+
+	put_unaligned_be32(p - buf - 4, buf);
+	put_unaligned_be16(profile, &buf[6]);
+	return p - buf;
+}
+
+/* Physical format information of a DVD-ROM, one or two layers (OTP) */
+static int fsg_dvd_physical_format(struct fsg_lun *curlun, u8 *buf)
+{
+	u32	sectors = curlun->num_sectors;
+	u32	start = 0x30000, end, end0 = 0;
+	u8	*pfi = buf + 4;
+	bool	dual = sectors > FSG_DVD_SL_SECTORS;
+
+	memset(buf, 0, 4 + 2048);
+	put_unaligned_be16(2048 + 2, buf);
+	pfi[0] = 0x01;			/* DVD-ROM, part version 1 */
+	pfi[1] = 0x0f;			/* 120 mm, rate not specified */
+	pfi[2] = dual ? 0x31 : 0x01;	/* Layers, OTP, embossed */
+	if (dual) {
+		u32 layer0 = sectors - sectors / 2;
+
+		end0 = start + layer0 - 1;
+		end = (~end0 & 0xffffff) + sectors / 2 - 1;
+	} else {
+		end = start + sectors - 1;
+	}
+	put_unaligned_be32(start, &pfi[4]);
+	put_unaligned_be32(end, &pfi[8]);
+	put_unaligned_be32(end0, &pfi[12]);
+	return 4 + 2048;
+}
+
+static int do_read_disc_structure(struct fsg_common *common,
+				  struct fsg_buffhd *bh)
+{
+	struct fsg_lun	*curlun = common->curlun;
+	u8		*buf = (u8 *)bh->buf;
+	u8		media = common->cmnd[1] & 0x0f;
+	u8		format = common->cmnd[7];
+
+	if (media == 0 && curlun->profile == FSG_PROFILE_DVD) {
+		switch (format) {
+		case 0x00:		/* Physical format information */
+			return fsg_dvd_physical_format(curlun, buf);
+		case 0x01:		/* Copyright: none, all regions */
+			memset(buf, 0, 8);
+			put_unaligned_be16(6, buf);
+			return 8;
+		case 0xff:		/* The structures there are */
+			memset(buf, 0, 12);
+			put_unaligned_be16(10, buf);
+			buf[4] = 0x00;
+			buf[5] = 0x40;	/* Readable */
+			put_unaligned_be16(2048 + 4, &buf[6]);
+			buf[8] = 0x01;
+			buf[9] = 0x40;
+			put_unaligned_be16(4 + 4, &buf[10]);
+			return 12;
+		}
+	}
+
+	curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+	return -EINVAL;
+}
+
+/* One closed session with one data track, the medium's only one */
+static int do_read_disc_information(struct fsg_common *common,
+				    struct fsg_buffhd *bh)
+{
+	struct fsg_lun	*curlun = common->curlun;
+	u8		*buf = (u8 *)bh->buf;
+
+	if ((common->cmnd[1] & 0x07) != 0) {	/* Standard information only */
+		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+		return -EINVAL;
+	}
+
+	memset(buf, 0, 34);
+	put_unaligned_be16(32, buf);
+	buf[2] = 0x0e;		/* Last session complete, disc complete */
+	buf[3] = 1;		/* First track */
+	buf[4] = 1;		/* Sessions */
+	buf[5] = 1;		/* First track in the last session */
+	buf[6] = 1;		/* Last track in the last session */
+	buf[7] = 0x20;		/* Unrestricted use */
+	put_unaligned_be32(0xffffffff, &buf[16]);	/* No next session */
+	put_unaligned_be32(0xffffffff, &buf[20]);	/* No next lead-out */
+	return 34;
+}
+
+static int do_read_track_information(struct fsg_common *common,
+				     struct fsg_buffhd *bh)
+{
+	struct fsg_lun	*curlun = common->curlun;
+	u8		*buf = (u8 *)bh->buf;
+	u32		address = get_unaligned_be32(&common->cmnd[2]);
+	bool		track1;
+
+	switch (common->cmnd[1] & 0x03) {
+	case 0:			/* By block */
+		track1 = address < curlun->num_sectors;
+		break;
+	case 1:			/* By track */
+	case 2:			/* By session */
+		track1 = address == 1;
+		break;
+	default:
+		track1 = false;
+	}
+	if (!track1) {
+		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+		return -EINVAL;
+	}
+
+	memset(buf, 0, 36);
+	put_unaligned_be16(34, buf);
+	buf[2] = 1;		/* Track */
+	buf[3] = 1;		/* Session */
+	buf[5] = 0x04;		/* Data, recorded uninterrupted */
+	buf[6] = 0x01;		/* Mode 1 */
+	put_unaligned_be32(curlun->num_sectors, &buf[24]);
+	put_unaligned_be32(curlun->num_sectors - 1, &buf[28]);
+	return 36;
+}
+
+/* READ CD for 2048-byte user data, as READ(10) gives it */
+static int do_read_cd(struct fsg_common *common)
+{
+	struct fsg_lun	*curlun = common->curlun;
+	u8		sector_type = (common->cmnd[1] >> 2) & 0x07;
+
+	if ((sector_type != 0 && sector_type != 2) ||	/* Any, or Mode 1 */
+	    (common->cmnd[1] & 0x03) != 0 ||
+	    common->cmnd[9] != 0x10 ||			/* User data only */
+	    common->cmnd[10] != 0) {			/* No subchannel */
+		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+		return -EINVAL;
+	}
+
+	common->cmnd[1] = 0;
+	return do_read(common);
+}
+
 static int do_mode_sense(struct fsg_common *common, struct fsg_buffhd *bh)
 {
 	struct fsg_lun	*curlun = common->curlun;
@@ -1340,6 +1590,23 @@ static int do_mode_sense(struct fsg_common *common, struct fsg_buffhd *bh)
 					/* Maximum prefetch ceiling */
 		}
 		buf += 12;
+	}
+
+	/* MM Capabilities and Mechanical Status, for optical LUNs */
+	if (curlun->cdrom && (page_code == 0x2a || all_pages)) {
+		valid_page = 1;
+		buf[0] = 0x2a;		/* Page code */
+		buf[1] = 20;		/* Page length */
+		memset(buf+2, 0, 20);	/* None of the fields are changeable */
+
+		if (!changeable_values) {
+			buf[2] = 0x08;	/* Reads DVD-ROM, as well as CD */
+			buf[6] = 0x29 | (curlun->prevent_medium_removal << 1);
+					/* Tray, eject, lock and its state */
+			put_unaligned_be16(2816, &buf[8]);	/* 16x, KB/s */
+			put_unaligned_be16(2816, &buf[14]);
+		}
+		buf += 22;
 	}
 
 	/*
@@ -1996,6 +2263,69 @@ static int do_scsi_command(struct fsg_common *common)
 				      "READ CAPACITY");
 		if (reply == 0)
 			reply = do_read_capacity(common, bh);
+		break;
+
+	case GPCMD_GET_CONFIGURATION:
+		if (!common->curlun || !common->curlun->cdrom)
+			goto unknown_cmnd;
+		common->data_size_from_cmnd =
+			get_unaligned_be16(&common->cmnd[7]);
+		reply = check_command(common, 10, DATA_DIR_TO_HOST,
+				      (1<<1) | (3<<2) | (3<<7), 0,
+				      "GET CONFIGURATION");
+		if (reply == 0)
+			reply = do_get_configuration(common, bh);
+		break;
+
+	case GPCMD_READ_DVD_STRUCTURE:
+		if (!common->curlun || !common->curlun->cdrom)
+			goto unknown_cmnd;
+		common->data_size_from_cmnd =
+			get_unaligned_be16(&common->cmnd[8]);
+		reply = check_command(common, 12, DATA_DIR_TO_HOST,
+				      (1<<1) | (0xf<<2) | (1<<6) | (1<<7) |
+				      (3<<8) | (1<<10), 1,
+				      "READ DISC STRUCTURE");
+		if (reply == 0)
+			reply = do_read_disc_structure(common, bh);
+		break;
+
+	case GPCMD_READ_DISC_INFO:
+		if (!common->curlun || !common->curlun->cdrom)
+			goto unknown_cmnd;
+		common->data_size_from_cmnd =
+			get_unaligned_be16(&common->cmnd[7]);
+		reply = check_command(common, 10, DATA_DIR_TO_HOST,
+				      (1<<1) | (3<<7), 1,
+				      "READ DISC INFORMATION");
+		if (reply == 0)
+			reply = do_read_disc_information(common, bh);
+		break;
+
+	case GPCMD_READ_TRACK_RZONE_INFO:
+		if (!common->curlun || !common->curlun->cdrom)
+			goto unknown_cmnd;
+		common->data_size_from_cmnd =
+			get_unaligned_be16(&common->cmnd[7]);
+		reply = check_command(common, 10, DATA_DIR_TO_HOST,
+				      (1<<1) | (0xf<<2) | (3<<7), 1,
+				      "READ TRACK INFORMATION");
+		if (reply == 0)
+			reply = do_read_track_information(common, bh);
+		break;
+
+	case GPCMD_READ_CD:
+		if (!common->curlun || !common->curlun->cdrom)
+			goto unknown_cmnd;
+		common->data_size_from_cmnd =
+			get_unaligned_be24(&common->cmnd[6]);
+		reply = check_command_size_in_blocks(common, 12,
+				      DATA_DIR_TO_HOST,
+				      (1<<1) | (0xf<<2) | (7<<6) | (1<<9) |
+				      (1<<10), 1,
+				      "READ CD");
+		if (reply == 0)
+			reply = do_read_cd(common);
 		break;
 
 	case READ_HEADER:
@@ -3233,6 +3563,23 @@ static ssize_t fsg_lun_opts_cdrom_store(struct config_item *item,
 
 CONFIGFS_ATTR(fsg_lun_opts_, cdrom);
 
+static ssize_t fsg_lun_opts_profile_show(struct config_item *item, char *page)
+{
+	return fsg_show_profile(to_fsg_lun_opts(item)->lun, page);
+}
+
+static ssize_t fsg_lun_opts_profile_store(struct config_item *item,
+					  const char *page, size_t len)
+{
+	struct fsg_lun_opts *opts = to_fsg_lun_opts(item);
+	struct fsg_opts *fsg_opts = to_fsg_opts(opts->group.cg_item.ci_parent);
+
+	return fsg_store_profile(opts->lun, &fsg_opts->common->filesem, page,
+				 len);
+}
+
+CONFIGFS_ATTR(fsg_lun_opts_, profile);
+
 static ssize_t fsg_lun_opts_nofua_show(struct config_item *item, char *page)
 {
 	return fsg_show_nofua(to_fsg_lun_opts(item)->lun, page);
@@ -3277,6 +3624,7 @@ static struct configfs_attribute *fsg_lun_attrs[] = {
 	&fsg_lun_opts_attr_ro,
 	&fsg_lun_opts_attr_removable,
 	&fsg_lun_opts_attr_cdrom,
+	&fsg_lun_opts_attr_profile,
 	&fsg_lun_opts_attr_nofua,
 	&fsg_lun_opts_attr_inquiry_string,
 	&fsg_lun_opts_attr_forced_eject,

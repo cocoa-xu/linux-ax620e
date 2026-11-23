@@ -244,7 +244,8 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 	min_sectors = 1;
 	if (curlun->cdrom) {
 		min_sectors = 300;	/* Smallest track is 300 frames */
-		if (num_sectors >= 256*60*75) {
+		if (curlun->profile == FSG_PROFILE_CD &&
+		    num_sectors >= 256*60*75) {
 			num_sectors = 256*60*75 - 1;
 			LINFO(curlun, "file too big: %s\n", filename);
 			LINFO(curlun, "using only first %d blocks\n",
@@ -300,6 +301,8 @@ void store_cdrom_address(u8 *dest, int msf, u32 addr)
 		 * Sector size is already set to 2048 bytes.
 		 */
 		addr += 2*75;		/* Lead-in occupies 2 seconds */
+		/* DVDs and BDs go past 255:59:74, the last address there is */
+		addr = min(addr, 256U*60*75 - 1);
 		dest[3] = addr % 75;	/* Frames */
 		addr /= 75;
 		dest[2] = addr % 60;	/* Seconds */
@@ -361,6 +364,18 @@ ssize_t fsg_show_cdrom(struct fsg_lun *curlun, char *buf)
 	return sprintf(buf, "%u\n", curlun->cdrom);
 }
 EXPORT_SYMBOL_GPL(fsg_show_cdrom);
+
+static const char * const fsg_profile_names[] = {
+	[FSG_PROFILE_CD]	= "cd",
+	[FSG_PROFILE_DVD]	= "dvd",
+	[FSG_PROFILE_BD]	= "bd",
+};
+
+ssize_t fsg_show_profile(struct fsg_lun *curlun, char *buf)
+{
+	return sprintf(buf, "%s\n", fsg_profile_names[curlun->profile]);
+}
+EXPORT_SYMBOL_GPL(fsg_show_profile);
 
 ssize_t fsg_show_removable(struct fsg_lun *curlun, char *buf)
 {
@@ -487,6 +502,27 @@ ssize_t fsg_store_cdrom(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(fsg_store_cdrom);
+
+/* The profile goes with the medium: it is set before a file is opened. */
+ssize_t fsg_store_profile(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+			  const char *buf, size_t count)
+{
+	int profile = sysfs_match_string(fsg_profile_names, buf);
+	ssize_t ret = count;
+
+	if (profile < 0)
+		return profile;
+
+	down_write(filesem);
+	if (fsg_lun_is_open(curlun))
+		ret = -EBUSY;
+	else
+		curlun->profile = profile;
+	up_write(filesem);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(fsg_store_profile);
 
 ssize_t fsg_store_removable(struct fsg_lun *curlun, const char *buf,
 			    size_t count)

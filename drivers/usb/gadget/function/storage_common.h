@@ -108,6 +108,7 @@ struct fsg_lun {
 	unsigned int	registered:1;
 	unsigned int	info_valid:1;
 	unsigned int	nofua:1;
+	unsigned int	profile:2;	/* enum fsg_profile, for cdrom LUNs */
 
 	u32		sense_data;
 	u32		sense_data_info;
@@ -120,6 +121,17 @@ struct fsg_lun {
 	const char	*name;		/* "lun.name" */
 	const char	**name_pfx;	/* "function.name" */
 	char		inquiry_string[INQUIRY_STRING_LEN];
+};
+
+/*
+ * The MMC profile an optical LUN reports for its medium. A CD is addressed
+ * in minutes, seconds and frames as well, which ends at 255:59:74; DVDs and
+ * BDs are addressed by block only.
+ */
+enum fsg_profile {
+	FSG_PROFILE_CD,
+	FSG_PROFILE_DVD,
+	FSG_PROFILE_BD,
 };
 
 static inline bool fsg_lun_is_open(struct fsg_lun *curlun)
@@ -207,6 +219,7 @@ ssize_t fsg_show_file(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 		      char *buf);
 ssize_t fsg_show_inquiry_string(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_show_cdrom(struct fsg_lun *curlun, char *buf);
+ssize_t fsg_show_profile(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_show_removable(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_store_ro(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 		     const char *buf, size_t count);
@@ -215,6 +228,8 @@ ssize_t fsg_store_file(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 		       const char *buf, size_t count);
 ssize_t fsg_store_cdrom(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 			const char *buf, size_t count);
+ssize_t fsg_store_profile(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+			  const char *buf, size_t count);
 ssize_t fsg_store_removable(struct fsg_lun *curlun, const char *buf,
 			    size_t count);
 ssize_t fsg_store_inquiry_string(struct fsg_lun *curlun, const char *buf,
