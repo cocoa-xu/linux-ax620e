@@ -584,6 +584,7 @@ int filter_send_tcp_ack(struct rwnx_hw *priv,
 		ack->saddr = ack_msg.saddr;
 		ack->daddr = ack_msg.daddr;
 		ack->seq = ack_msg.seq;
+		ack->win = ack_msg.win;
 		write_sequnlock_bh(&ack_m->ack_info[index].seqlock);
 	}
 
