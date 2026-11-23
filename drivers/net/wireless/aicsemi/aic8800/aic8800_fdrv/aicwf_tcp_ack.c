@@ -440,12 +440,15 @@ int tcp_ack_handle_new(struct msg_buf *new_msgbuf,
 	int ret = 0;
 	struct msg_buf *drop_msg = NULL;
 	s32 advance;
+	bool duplicate;
 
 	write_seqlock_bh(&ack_info->seqlock);
 
 	ack_info->last_time = jiffies;
 	ack = &ack_info->ack_msg;
 	advance = (s32)(ack_msg->seq - ack->seq);
+	/* A window update moves the window, a duplicate ACK nothing */
+	duplicate = advance == 0 && ack_msg->win == ack->win;
 
 	/* A held ACK says no more than this one */
 	if (ack_info->msgbuf) {
@@ -457,19 +460,20 @@ int tcp_ack_handle_new(struct msg_buf *new_msgbuf,
 	    !U32_BEFORE(ack_msg->seq, ack_info->psh_seq)) {
 		ack_info->psh_flag = 0;
 		quick_ack = 1;
-	} else if (advance > 0) {
+	} else if (!duplicate) {
 		ack_info->drop_cnt++;
 	}
 
 	ack->seq = ack_msg->seq;
+	ack->win = ack_msg->win;
 
 	/*
-	 * Only an ACK that moves on and says nothing else may wait: duplicate
-	 * ACKs and ACKs with SACK blocks or a small window are how the sender
-	 * learns of losses, and an ACK behind the one kept is a new connection
-	 * on the same ports.
+	 * Only an ACK that moves on, the window or the acknowledged data, and
+	 * says nothing else may wait: duplicate ACKs and ACKs with SACK blocks
+	 * or a small window are how the sender learns of losses, and an ACK
+	 * behind the one kept is a new connection on the same ports.
 	 */
-	if (quick_ack || advance <= 0 || type != 1 ||
+	if (quick_ack || advance < 0 || duplicate || type != 1 ||
 	    (!ack_info->in_send_msg &&
 	     ack_info->drop_cnt >= atomic_read(&ack_m->max_drop_cnt))) {
 		ack_info->drop_cnt = 0;
