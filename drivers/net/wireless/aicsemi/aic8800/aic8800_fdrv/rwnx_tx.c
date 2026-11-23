@@ -1449,8 +1449,8 @@ netdev_tx_t rwnx_start_xmit(struct sk_buff *skb, struct net_device *dev)
 		skb->priority = 0;
 
 #ifdef CONFIG_FILTER_TCP_ACK
-	if(cpu_to_le16(skb->len) <= MAX_TCP_ACK){
-		msgbuf=intf_tcp_alloc_msg(msgbuf);
+	if (cpu_to_le16(skb->len) <= MAX_TCP_ACK &&
+	    (msgbuf = intf_tcp_alloc_msg(msgbuf)) != NULL) {
 		msgbuf->rwnx_vif=rwnx_vif;
 		msgbuf->skb=skb;
 		if(filter_send_tcp_ack(rwnx_hw,msgbuf,skb->data,cpu_to_le16(skb->len))){

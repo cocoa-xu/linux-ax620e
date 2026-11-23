@@ -6,12 +6,7 @@ extern int intf_tx(struct rwnx_hw *priv,struct msg_buf *msg);
 struct msg_buf *intf_tcp_alloc_msg(struct msg_buf *msg)
 {
 	//printk("%s \n",__func__);
-	int len=sizeof(struct msg_buf) ;
-	msg = kzalloc(len , /*GFP_KERNEL*/GFP_ATOMIC);
-	if(!msg)
-		printk("%s: alloc failed \n", __func__);
-	memset(msg,0,len);
-	return msg;
+	return kzalloc(sizeof(struct msg_buf), GFP_ATOMIC);
 }
 						
 void intf_tcp_drop_msg(struct rwnx_hw *priv,
@@ -170,16 +165,18 @@ int is_drop_tcp_ack(struct tcphdr *tcphdr, int tcp_tot_len,
 
 			switch (opcode) {
 			case TCPOPT_EOL:
+				len = 0;
 				break;
 			case TCPOPT_NOP:
 				len--;
 				continue;
 			default:
 				opsize = *ptr++;
-				if (opsize < 2)
+				/* Malformed options: leave the ACK alone */
+				if (opsize < 2 || opsize > len) {
+					drop = 0;
 					break;
-				if (opsize > len)
-					break;
+				}
 
 				switch (opcode) {
 				/* TODO: Add other ignore opt */
@@ -232,8 +229,8 @@ int tcp_check_ack(unsigned char *buf,
 	ip_hdr_len = iphdr->ihl * 4;
 	temp = (unsigned char *)(iphdr) + ip_hdr_len;
 	tcphdr = (struct tcphdr *)temp;
-	/* TCP_FLAG_ACK */
-	if (!(temp[13] & 0x10))
+	/* Only ACKs: SYN, FIN, RST and URG always go out as they are */
+	if (!(temp[13] & 0x10) || (temp[13] & 0x27))
 		return 0;
 
 	tcp_tot_len = ntohs(iphdr->tot_len) - ip_hdr_len;// tcp total len
@@ -442,72 +439,56 @@ int tcp_ack_handle_new(struct msg_buf *new_msgbuf,
 	struct tcp_ack_msg *ack;
 	int ret = 0;
 	struct msg_buf *drop_msg = NULL;
-	//struct msg_buf * send_msg = NULL;
-	//printk("",);
+	s32 advance;
+
 	write_seqlock_bh(&ack_info->seqlock);
 
-        ack_info->last_time = jiffies;
-        ack = &ack_info->ack_msg;
+	ack_info->last_time = jiffies;
+	ack = &ack_info->ack_msg;
+	advance = (s32)(ack_msg->seq - ack->seq);
 
-	if(U32_BEFORE(ack->seq, ack_msg->seq)){
-		if (ack_info->msgbuf) {
-			drop_msg = ack_info->msgbuf;
-			ack_info->msgbuf = NULL;
-			//ack_info->drop_cnt++;
-		}
-
-		if (ack_info->psh_flag &&
-		    !U32_BEFORE(ack_msg->seq, ack_info->psh_seq)) {
-			ack_info->psh_flag = 0;
-			quick_ack = 1;
-		} else {
-			ack_info->drop_cnt++;
-		}
-
-		ack->seq = ack_msg->seq;
-
-		if(quick_ack || (!ack_info->in_send_msg &&
-				  (ack_info->drop_cnt >=
-				   atomic_read(&ack_m->max_drop_cnt)))){
-			ack_info->drop_cnt = 0;
-			//send_msg = new_msgbuf;
-			ack_info->in_send_msg = new_msgbuf;
-			timer_delete(&ack_info->timer);
-		}else{
-			ret = 1;
-			ack_info->msgbuf = new_msgbuf;
-			if (!timer_pending(&ack_info->timer))
-				mod_timer(&ack_info->timer,
-					  (jiffies + msecs_to_jiffies(5)));
-		}
-		
-		//ret = 1;
-	}else {
-		printk("%s before ack: %d, %d\n",
-		       __func__, ack->seq, ack_msg->seq);
-		drop_msg = new_msgbuf;
-		ret = 1;
+	/* A held ACK says no more than this one */
+	if (ack_info->msgbuf) {
+		drop_msg = ack_info->msgbuf;
+		ack_info->msgbuf = NULL;
 	}
 
-	/*if(send_msg){
-		intf_tx(ack_m->priv,send_msg);
-		ack_info->in_send_msg=NULL;
-	}*/
+	if (ack_info->psh_flag &&
+	    !U32_BEFORE(ack_msg->seq, ack_info->psh_seq)) {
+		ack_info->psh_flag = 0;
+		quick_ack = 1;
+	} else if (advance > 0) {
+		ack_info->drop_cnt++;
+	}
 
-	//ack_info->in_send_msg=NULL;
-	
+	ack->seq = ack_msg->seq;
+
+	/*
+	 * Only an ACK that moves on and says nothing else may wait: duplicate
+	 * ACKs and ACKs with SACK blocks or a small window are how the sender
+	 * learns of losses, and an ACK behind the one kept is a new connection
+	 * on the same ports.
+	 */
+	if (quick_ack || advance <= 0 || type != 1 ||
+	    (!ack_info->in_send_msg &&
+	     ack_info->drop_cnt >= atomic_read(&ack_m->max_drop_cnt))) {
+		ack_info->drop_cnt = 0;
+		ack_info->in_send_msg = new_msgbuf;
+		timer_delete(&ack_info->timer);
+	} else {
+		ret = 1;
+		ack_info->msgbuf = new_msgbuf;
+		if (!timer_pending(&ack_info->timer))
+			mod_timer(&ack_info->timer,
+				  (jiffies + msecs_to_jiffies(5)));
+	}
+
 	write_sequnlock_bh(&ack_info->seqlock);
-
-    	/*if(send_msg){
-            intf_tx(ack_m->priv,send_msg);
-            //ack_info->in_send_msg=NULL;
-    	}*/
 
 	if (drop_msg)
 		intf_tcp_drop_msg(ack_m->priv, drop_msg);// drop skb
 
 	return ret;
-
 }
 
 void filter_rx_tcp_ack(struct rwnx_hw *priv,
