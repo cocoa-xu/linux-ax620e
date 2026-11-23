@@ -74,6 +74,7 @@ do {									\
 #define SS_COMMUNICATION_FAILURE		0x040800
 #define SS_INVALID_COMMAND			0x052000
 #define SS_INVALID_FIELD_IN_CDB			0x052400
+#define SS_ILLEGAL_MODE_FOR_THIS_TRACK		0x056400
 #define SS_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE	0x052100
 #define SS_LOGICAL_UNIT_NOT_SUPPORTED		0x052500
 #define SS_MEDIUM_NOT_PRESENT			0x023a00
@@ -95,10 +96,37 @@ do {									\
  */
 #define INQUIRY_STRING_LEN ((size_t) (8 + 16 + 4 + 1))
 
+/*
+ * A track of a CD image that keeps its sectors as the disc has them, such as
+ * a CUE sheet's BIN, from the "tracks" attribute: where its sectors are in
+ * the file and their size, its mode and the control bits of its Q
+ * subchannel. Its sectors follow those of the track before it on the disc,
+ * the first track's from LBA 0; its pregap (index 0) comes before its start
+ * (index 1).
+ */
+struct fsg_cd_track {
+	loff_t	offset;		/* of its first sector, in the file */
+	u32	first;		/* its first sector, the pregap's */
+	u32	start;		/* index 1 */
+	u32	end;		/* the sector after its last */
+	u32	pregap;
+	u16	size;		/* 2048, 2336 or 2352 bytes in the file */
+	u8	number;
+	u8	control;	/* data 0x4, copy permitted 0x2, ... */
+	u8	mode;		/* 0 for audio, 1 or 2 for data */
+};
+
+#define FSG_CD_MAX_TRACKS	99
+
 struct fsg_lun {
 	struct file	*filp;
 	loff_t		file_length;
 	loff_t		num_sectors;
+
+	/* The CD's tracks, or none for one data track of 2048-byte sectors */
+	struct fsg_cd_track *tracks;
+	unsigned int	num_tracks;
+	u32		cd_position;	/* For READ SUB-CHANNEL: what READ CD read last */
 
 	unsigned int	initially_ro:1;
 	unsigned int	ro:1;
@@ -220,6 +248,8 @@ ssize_t fsg_show_file(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 ssize_t fsg_show_inquiry_string(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_show_cdrom(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_show_profile(struct fsg_lun *curlun, char *buf);
+ssize_t fsg_show_tracks(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+			char *buf);
 ssize_t fsg_show_removable(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_store_ro(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 		     const char *buf, size_t count);
@@ -230,6 +260,8 @@ ssize_t fsg_store_cdrom(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 			const char *buf, size_t count);
 ssize_t fsg_store_profile(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 			  const char *buf, size_t count);
+ssize_t fsg_store_tracks(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+			 const char *buf, size_t count);
 ssize_t fsg_store_removable(struct fsg_lun *curlun, const char *buf,
 			    size_t count);
 ssize_t fsg_store_inquiry_string(struct fsg_lun *curlun, const char *buf,

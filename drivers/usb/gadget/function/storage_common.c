@@ -24,6 +24,9 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/kstrtox.h>
+#include <linux/math64.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/usb/composite.h>
 
 #include "storage_common.h"
@@ -173,8 +176,50 @@ void fsg_lun_close(struct fsg_lun *curlun)
 		fput(curlun->filp);
 		curlun->filp = NULL;
 	}
+	/* The tracks are the medium's */
+	kfree(curlun->tracks);
+	curlun->tracks = NULL;
+	curlun->num_tracks = 0;
 }
 EXPORT_SYMBOL_GPL(fsg_lun_close);
+
+/* The sectors a CD addresses, up to 99:59:74 after the 2 s before LBA 0 */
+#define FSG_CD_SECTORS	(100 * 60 * 75 - 150)
+
+/*
+ * Lays the tracks out on the disc from the file's size: each runs to the
+ * next one's offset, the last to the end of the file. Gives the disc's
+ * sectors.
+ */
+static int fsg_cd_layout(struct fsg_cd_track *tracks, unsigned int count,
+			 loff_t size, u32 *sectors)
+{
+	u32 lba = 0;
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		struct fsg_cd_track *t = &tracks[i];
+		loff_t end = i + 1 < count ? tracks[i + 1].offset : size;
+		u32 rem;
+		u64 n;
+
+		if (end > size || end <= t->offset)
+			return -EINVAL;
+		n = div_u64_rem(end - t->offset, t->size, &rem);
+		if ((i + 1 < count && rem) || n <= t->pregap ||
+		    n > FSG_CD_SECTORS - lba)
+			return -EINVAL;
+		t->first = lba;
+		t->start = lba + t->pregap;
+		lba += n;
+		t->end = lba;
+	}
+	if (lba < 300)		/* Smallest track is 300 frames */
+		return -EINVAL;
+
+	*sectors = lba;
+	return 0;
+}
 
 int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 {
@@ -256,6 +301,19 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 		LINFO(curlun, "file too small: %s\n", filename);
 		rc = -ETOOSMALL;
 		goto out;
+	}
+
+	/* Tracks given for a new medium: a CD with sectors as the file has them */
+	if (curlun->tracks && !fsg_lun_is_open(curlun)) {
+		u32 sectors;
+
+		if (!curlun->cdrom || curlun->profile != FSG_PROFILE_CD ||
+		    fsg_cd_layout(curlun->tracks, curlun->num_tracks, size,
+				  &sectors)) {
+			LINFO(curlun, "tracks do not fit: %s\n", filename);
+			goto out;
+		}
+		num_sectors = sectors;
 	}
 
 	if (fsg_lun_is_open(curlun))
@@ -376,6 +434,25 @@ ssize_t fsg_show_profile(struct fsg_lun *curlun, char *buf)
 	return sprintf(buf, "%s\n", fsg_profile_names[curlun->profile]);
 }
 EXPORT_SYMBOL_GPL(fsg_show_profile);
+
+ssize_t fsg_show_tracks(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+			char *buf)
+{
+	ssize_t len = 0;
+	unsigned int i;
+
+	down_read(filesem);
+	for (i = 0; i < curlun->num_tracks; i++) {
+		const struct fsg_cd_track *t = &curlun->tracks[i];
+
+		len += sysfs_emit_at(buf, len, "%u %u %u %u %u %llu\n",
+				     t->number, t->mode, t->control, t->size,
+				     t->pregap, (unsigned long long)t->offset);
+	}
+	up_read(filesem);
+	return len;
+}
+EXPORT_SYMBOL_GPL(fsg_show_tracks);
 
 ssize_t fsg_show_removable(struct fsg_lun *curlun, char *buf)
 {
@@ -523,6 +600,93 @@ ssize_t fsg_store_profile(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(fsg_store_profile);
+
+/* Audio in 2352-byte sectors; mode 1 in 2048 or 2352, mode 2 in 2336 or 2352 */
+static bool fsg_cd_track_valid(unsigned int mode, unsigned int control,
+			       unsigned int size)
+{
+	if (control > 0xf || !(control & 0x4) != !mode)
+		return false;
+
+	switch (mode) {
+	case 0:
+		return size == 2352;
+	case 1:
+		return size == 2048 || size == 2352;
+	case 2:
+		return size == 2336 || size == 2352;
+	}
+	return false;
+}
+
+/*
+ * The tracks of the next medium, a line each: number, mode (0 for audio, 1
+ * or 2), the control bits of its Q subchannel, the bytes of a sector in the
+ * file, the sectors of its pregap and the offset in the file of its first
+ * one. Nothing for one data track of 2048-byte sectors.
+ */
+ssize_t fsg_store_tracks(struct fsg_lun *curlun, struct rw_semaphore *filesem,
+			 const char *buf, size_t count)
+{
+	struct fsg_cd_track *tracks;
+	unsigned int n = 0;
+	char *text, *rest, *line;
+	ssize_t ret = count;
+
+	tracks = kcalloc(FSG_CD_MAX_TRACKS, sizeof(*tracks), GFP_KERNEL);
+	text = kstrndup(buf, count, GFP_KERNEL);
+	if (!tracks || !text) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	rest = text;
+	while ((line = strsep(&rest, "\n"))) {
+		unsigned int number, mode, control, size, pregap;
+		unsigned long long offset;
+		struct fsg_cd_track *t = &tracks[n];
+
+		line = strim(line);
+		if (!*line)
+			continue;
+		if (n == FSG_CD_MAX_TRACKS ||
+		    sscanf(line, "%u %u %u %u %u %llu", &number, &mode,
+			   &control, &size, &pregap, &offset) != 6 ||
+		    number < 1 || number > FSG_CD_MAX_TRACKS ||
+		    !fsg_cd_track_valid(mode, control, size) ||
+		    offset > LLONG_MAX ||
+		    (n && (number != t[-1].number + 1 ||
+			   offset <= t[-1].offset))) {
+			ret = -EINVAL;
+			goto out;
+		}
+		t->number = number;
+		t->mode = mode;
+		t->control = control;
+		t->size = size;
+		t->pregap = pregap;
+		t->offset = offset;
+		n++;
+	}
+
+	down_write(filesem);
+	if (fsg_lun_is_open(curlun)) {
+		ret = -EBUSY;
+	} else {
+		kfree(curlun->tracks);
+		curlun->tracks = n ? tracks : NULL;
+		curlun->num_tracks = n;
+		if (n)
+			tracks = NULL;
+	}
+	up_write(filesem);
+
+out:
+	kfree(tracks);
+	kfree(text);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(fsg_store_tracks);
 
 ssize_t fsg_store_removable(struct fsg_lun *curlun, const char *buf,
 			    size_t count)

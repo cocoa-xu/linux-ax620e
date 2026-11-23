@@ -47,6 +47,15 @@
  *				(the default), "dvd" or "bd".  Set before
  *				the file; a DVD or BD is not limited to the
  *				CD's 255 minutes.
+ *	->tracks	For a CD whose file has its sectors as the disc
+ *				has them, such as a CUE sheet's BIN: a line
+ *				for each track, "number mode control size
+ *				pregap offset" (mode 0 for audio, 1 or 2 for
+ *				data; the Q subchannel's control bits; 2048,
+ *				2336 or 2352 bytes a sector; the sectors before
+ *				index 1; where its first sector is in the
+ *				file).  Set without a medium, before the file;
+ *				ejecting the medium clears it.
  *	->nofua		Flag specifying that FUA flag in SCSI WRITE(10,12)
  *				commands for this LUN shall be ignored.
  *
@@ -172,6 +181,7 @@
 /* #define VERBOSE_DEBUG */
 /* #define DUMP_MSGS */
 
+#include <linux/bcd.h>
 #include <linux/blkdev.h>
 #include <linux/cdrom.h>
 #include <linux/completion.h>
@@ -201,6 +211,7 @@
 #include <linux/usb/composite.h>
 
 #include <linux/nospec.h>
+#include <linux/once.h>
 
 #include "configfs.h"
 
@@ -608,6 +619,620 @@ static int sleep_thread(struct fsg_common *common, bool can_freeze,
 
 /*-------------------------------------------------------------------------*/
 
+/*-------------------------------------------------------------------------*/
+
+/*
+ * CDs whose image keeps the sectors as the disc has them, as told by the
+ * LUN's tracks (struct fsg_cd_track): audio, and data of mode 1 or mode 2 in
+ * sectors of 2352 bytes, or of what follows the header.
+ */
+
+/* What READ CD selects of a sector's main channel (its byte 9) */
+#define FSG_CD_SYNC		0x80
+#define FSG_CD_SUBHEADER	0x40
+#define FSG_CD_HEADER		0x20
+#define FSG_CD_USER		0x10
+#define FSG_CD_EDC_ECC		0x08
+
+/* What a sector is read as */
+enum fsg_cd_kind {
+	FSG_CD_AUDIO,
+	FSG_CD_MODE1,
+	FSG_CD_MODE2,		/* Formless: 2336 bytes of user data */
+	FSG_CD_FORM1,
+	FSG_CD_FORM2,
+};
+
+/* READ CD's expected sector type of each kind; 0 takes any */
+static const u8 fsg_cd_types[] = {
+	[FSG_CD_AUDIO] = 1, [FSG_CD_MODE1] = 2, [FSG_CD_MODE2] = 3,
+	[FSG_CD_FORM1] = 4, [FSG_CD_FORM2] = 5,
+};
+
+/* Where the parts of a sector are in its 2352 bytes, in the order sent */
+static const u8 fsg_cd_part_bits[] = {
+	FSG_CD_SYNC, FSG_CD_HEADER, FSG_CD_SUBHEADER, FSG_CD_USER,
+	FSG_CD_EDC_ECC,
+};
+
+static const struct {
+	u16 at, len;
+} fsg_cd_parts[][ARRAY_SIZE(fsg_cd_part_bits)] = {
+	[FSG_CD_AUDIO] = { {0, 0}, {0, 0}, {0, 0}, {0, 2352}, {0, 0} },
+	[FSG_CD_MODE1] = { {0, 12}, {12, 4}, {0, 0}, {16, 2048}, {2064, 288} },
+	[FSG_CD_MODE2] = { {0, 12}, {12, 4}, {0, 0}, {16, 2336}, {0, 0} },
+	[FSG_CD_FORM1] = { {0, 12}, {12, 4}, {16, 8}, {24, 2048}, {2072, 280} },
+	[FSG_CD_FORM2] = { {0, 12}, {12, 4}, {16, 8}, {24, 2324}, {2348, 4} },
+};
+
+static const u8 fsg_cd_sync[12] = {
+	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00
+};
+
+/* GF(2^8) for the ECC and the EDC's CRC, as in ECMA-130 annexes A and B */
+static u8 fsg_ecc_f[256], fsg_ecc_b[256];
+static u32 fsg_edc_table[256];
+
+static void fsg_cd_init_tables(void)
+{
+	u32 i, j, edc;
+
+	for (i = 0; i < 256; i++) {
+		j = (i << 1) ^ (i & 0x80 ? 0x11d : 0);
+		fsg_ecc_f[i] = j;
+		fsg_ecc_b[i ^ j] = i;
+		edc = i;
+		for (j = 0; j < 8; j++)
+			edc = (edc >> 1) ^ (edc & 1 ? 0xd8018001 : 0);
+		fsg_edc_table[i] = edc;
+	}
+}
+
+static u32 fsg_cd_edc(const u8 *data, size_t len)
+{
+	u32 edc = 0;
+
+	while (len--)
+		edc = (edc >> 8) ^ fsg_edc_table[(edc ^ *data++) & 0xff];
+	return edc;
+}
+
+/* One of the two Reed-Solomon product code parities, P or Q */
+static void fsg_cd_ecc(const u8 *src, u32 majors, u32 minors, u32 major_mult,
+		       u32 minor_inc, u8 *dest)
+{
+	u32 size = majors * minors, major, minor;
+
+	for (major = 0; major < majors; major++) {
+		u32 index = (major >> 1) * major_mult + (major & 1);
+		u8 a = 0, b = 0;
+
+		for (minor = 0; minor < minors; minor++) {
+			u8 v = src[index];
+
+			index += minor_inc;
+			if (index >= size)
+				index -= size;
+			a ^= v;
+			b ^= v;
+			a = fsg_ecc_f[a];
+		}
+		a = fsg_ecc_b[fsg_ecc_f[a] ^ b];
+		dest[major] = a;
+		dest[major + majors] = a ^ b;
+	}
+}
+
+/* The EDC and ECC of a mode 1 sector with its sync, header and data */
+static void fsg_cd_mode1_edc_ecc(u8 *raw)
+{
+	DO_ONCE(fsg_cd_init_tables);
+	put_unaligned_le32(fsg_cd_edc(raw, 2064), raw + 2064);
+	memset(raw + 2068, 0, 8);
+	fsg_cd_ecc(raw + 12, 86, 24, 2, 86, raw + 2076);
+	fsg_cd_ecc(raw + 12, 52, 43, 86, 88, raw + 2248);
+}
+
+/* Minutes, seconds and frames in BCD, as the disc has them */
+static void fsg_cd_msf_bcd(u8 *dest, u32 frames)
+{
+	dest[0] = bin2bcd(frames / (60 * 75));
+	dest[1] = bin2bcd(frames / 75 % 60);
+	dest[2] = bin2bcd(frames % 75);
+}
+
+static bool fsg_cd_has_tracks(struct fsg_lun *curlun)
+{
+	return curlun->tracks && fsg_lun_is_open(curlun);
+}
+
+/* The track a sector is in, NULL past the last */
+static const struct fsg_cd_track *fsg_cd_track_of(struct fsg_lun *curlun,
+						   u32 lba)
+{
+	unsigned int i;
+
+	for (i = 0; i < curlun->num_tracks; i++)
+		if (lba < curlun->tracks[i].end)
+			return &curlun->tracks[i];
+	return NULL;
+}
+
+/* Part of a sector as the file keeps it */
+static int fsg_cd_pread(struct fsg_lun *curlun, const struct fsg_cd_track *t,
+			u32 lba, unsigned int skip, void *buf, size_t len)
+{
+	loff_t pos = t->offset + (loff_t)(lba - t->first) * t->size + skip;
+
+	return kernel_read(curlun->filp, buf, len, &pos) == len ? 0 : -EIO;
+}
+
+/*
+ * A sector as the disc has it: as the file keeps it, with the sync and the
+ * header it leaves out made anew, and for a mode 1 sector its EDC and ECC
+ * when asked for.
+ */
+static int fsg_cd_raw(struct fsg_lun *curlun, const struct fsg_cd_track *t,
+		      u32 lba, u8 *raw, bool edc_ecc)
+{
+	if (t->size == 2352)
+		return fsg_cd_pread(curlun, t, lba, 0, raw, 2352);
+
+	if (fsg_cd_pread(curlun, t, lba, 0, raw + 16, t->size))
+		return -EIO;
+	memcpy(raw, fsg_cd_sync, sizeof(fsg_cd_sync));
+	fsg_cd_msf_bcd(raw + 12, lba + 150);
+	raw[15] = t->mode;
+	if (t->mode == 1 && edc_ecc)
+		fsg_cd_mode1_edc_ecc(raw);
+	return 0;
+}
+
+/*
+ * What a sector is read as: audio or mode 1 as its track, and mode 2 either
+ * formless, when READ CD asks for that, or in the form its subheader gives.
+ */
+static int fsg_cd_kind(struct fsg_lun *curlun, const struct fsg_cd_track *t,
+		       u32 lba, u8 type, enum fsg_cd_kind *kind)
+{
+	u8 subheader[8];
+
+	if (t->mode != 2 || type == fsg_cd_types[FSG_CD_MODE2]) {
+		*kind = t->mode == 0 ? FSG_CD_AUDIO :
+			t->mode == 1 ? FSG_CD_MODE1 : FSG_CD_MODE2;
+		return 0;
+	}
+	if (fsg_cd_pread(curlun, t, lba, t->size == 2352 ? 16 : 0, subheader,
+			 sizeof(subheader)))
+		return -EIO;
+	*kind = subheader[2] & 0x20 ? FSG_CD_FORM2 : FSG_CD_FORM1;
+	return 0;
+}
+
+/* The Q subchannel in mode 1, where a sector is, with its CRC */
+static void fsg_cd_q(const struct fsg_cd_track *t, u32 lba, u8 *q)
+{
+	bool pregap = lba < t->start;
+	u16 crc = 0;
+	int i, j;
+
+	q[0] = t->control << 4 | 0x01;
+	q[1] = bin2bcd(t->number);
+	q[2] = pregap ? 0 : 1;
+	fsg_cd_msf_bcd(q + 3, pregap ? t->start - lba : lba - t->start);
+	q[6] = 0;
+	fsg_cd_msf_bcd(q + 7, lba + 150);
+	for (i = 0; i < 10; i++) {
+		crc ^= q[i] << 8;
+		for (j = 0; j < 8; j++)
+			crc = crc & 0x8000 ? crc << 1 ^ 0x1021 : crc << 1;
+	}
+	put_unaligned_be16(~crc, q + 10);
+}
+
+/* READ CD's subchannel of a sector: 1 raw P-W, 2 Q, 4 R-W */
+static void fsg_cd_subchannel(const struct fsg_cd_track *t, u32 lba, u8 sub,
+			      u8 *out)
+{
+	u8 p = lba < t->start ? 0x80 : 0, q[12];
+	int i;
+
+	memset(out, 0, 96);
+	if (sub == 4)
+		return;
+
+	fsg_cd_q(t, lba, q);
+	if (sub == 2) {
+		memcpy(out, q, sizeof(q));
+		out[15] = p;
+		return;
+	}
+	for (i = 0; i < 96; i++)
+		out[i] = p | ((q[i / 8] >> (7 - i % 8)) & 1) << 6;
+}
+
+static unsigned int fsg_cd_sub_size(u8 sub)
+{
+	return sub == 2 ? 16 : sub ? 96 : 0;
+}
+
+/* The C2 error pointers, all clear, and with the block error byte */
+static unsigned int fsg_cd_c2_size(u8 select)
+{
+	static const u16 sizes[] = { 0, 294, 296 };
+
+	return sizes[(select >> 1) & 3];
+}
+
+static unsigned int fsg_cd_main_size(enum fsg_cd_kind kind, u8 select)
+{
+	unsigned int i, size = 0;
+
+	for (i = 0; i < ARRAY_SIZE(fsg_cd_part_bits); i++)
+		if (select & fsg_cd_part_bits[i])
+			size += fsg_cd_parts[kind][i].len;
+	return size;
+}
+
+/* What goes to the host, a buffer at a time */
+struct fsg_cd_out {
+	struct fsg_buffhd	*bh;
+	u32			used;
+	u32			left;
+};
+
+/* Puts data, or zeros for NULL, into the buffers, sending each full one */
+static int fsg_cd_put(struct fsg_common *common, struct fsg_cd_out *out,
+		      const u8 *data, u32 len)
+{
+	int rc;
+
+	while (len && out->left) {
+		u32 n;
+
+		if (!out->bh || out->used == FSG_BUFLEN) {
+			if (out->bh) {
+				out->bh->inreq->length = out->used;
+				out->bh->inreq->zero = 0;
+				out->bh->state = BUF_STATE_FULL;
+				if (!start_in_transfer(common, out->bh))
+					return -EIO;
+				common->next_buffhd_to_fill = out->bh->next;
+			}
+			out->bh = common->next_buffhd_to_fill;
+			rc = sleep_thread(common, false, out->bh);
+			if (rc) {
+				out->bh = NULL;
+				return rc;
+			}
+			out->used = 0;
+		}
+
+		n = min3(len, FSG_BUFLEN - out->used, out->left);
+		if (data) {
+			memcpy(out->bh->buf + out->used, data, n);
+			data += n;
+		} else {
+			memset(out->bh->buf + out->used, 0, n);
+		}
+		out->used += n;
+		out->left -= n;
+		len -= n;
+		common->residue -= n;
+	}
+	return 0;
+}
+
+/* The last buffer is for finish_reply to send */
+static int fsg_cd_put_end(struct fsg_cd_out *out)
+{
+	if (out->bh) {
+		out->bh->inreq->length = out->used;
+		out->bh->state = BUF_STATE_FULL;
+	}
+	return -EIO;		/* No default reply */
+}
+
+static void fsg_cd_sense(struct fsg_lun *curlun, u32 sense, u32 lba)
+{
+	curlun->sense_data = sense;
+	curlun->sense_data_info = lba;
+	curlun->info_valid = 1;
+}
+
+/* READ(10) and the like: the 2048 bytes of a data sector, of mode 1 or form 1 */
+static int fsg_cd_read_data(struct fsg_common *common, u32 lba)
+{
+	struct fsg_lun *curlun = common->curlun;
+	u32 count = common->data_size_from_cmnd >> 11;
+	struct fsg_cd_out out = { .left = common->data_size_from_cmnd };
+	enum fsg_cd_kind kind;
+	u32 i;
+	u8 *buf;
+	int rc = 0;
+
+	if (count > curlun->num_sectors - lba) {
+		curlun->sense_data = SS_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE;
+		return -EINVAL;
+	}
+	for (i = 0; i < count; i++) {
+		const struct fsg_cd_track *t = fsg_cd_track_of(curlun, lba + i);
+
+		if (fsg_cd_kind(curlun, t, lba + i, 0, &kind)) {
+			fsg_cd_sense(curlun, SS_UNRECOVERED_READ_ERROR, lba + i);
+			return -EINVAL;
+		}
+		if (kind != FSG_CD_MODE1 && kind != FSG_CD_FORM1) {
+			fsg_cd_sense(curlun, SS_ILLEGAL_MODE_FOR_THIS_TRACK,
+				     lba + i);
+			return -EINVAL;
+		}
+	}
+
+	buf = kmalloc(2048, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	for (i = 0; i < count && !rc; i++) {
+		const struct fsg_cd_track *t = fsg_cd_track_of(curlun, lba + i);
+		unsigned int skip = t->size == 2352 ? (t->mode == 1 ? 16 : 24) :
+				    t->size == 2336 ? 8 : 0;
+
+		if (fsg_cd_pread(curlun, t, lba + i, skip, buf, 2048)) {
+			fsg_cd_sense(curlun, SS_UNRECOVERED_READ_ERROR, lba + i);
+			break;
+		}
+		rc = fsg_cd_put(common, &out, buf, 2048);
+	}
+	kfree(buf);
+	return rc ? rc : fsg_cd_put_end(&out);
+}
+
+/*
+ * The bytes READ CD sends for what it asks: checks that each sector is of
+ * the expected type, gives the sense of what is wrong, else 0.
+ */
+static u32 fsg_cd_read_cd_size(struct fsg_common *common, u32 *bad)
+{
+	struct fsg_lun *curlun = common->curlun;
+	u8 type = (common->cmnd[1] >> 2) & 0x07;
+	u32 lba = get_unaligned_be32(&common->cmnd[2]);
+	u32 count = get_unaligned_be24(&common->cmnd[6]);
+	u8 select = common->cmnd[9], sub = common->cmnd[10] & 0x07;
+	u64 size = 0;
+	u32 i;
+
+	common->data_size_from_cmnd = 0;
+	if (type > 5 || ((select >> 1) & 3) == 3 || sub == 3 || sub > 4)
+		return SS_INVALID_FIELD_IN_CDB;
+	if (lba >= curlun->num_sectors || count > curlun->num_sectors - lba)
+		return SS_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE;
+
+	for (i = 0; i < count; i++) {
+		const struct fsg_cd_track *t = fsg_cd_track_of(curlun, lba + i);
+		enum fsg_cd_kind kind;
+
+		*bad = lba + i;
+		if (fsg_cd_kind(curlun, t, lba + i, type, &kind))
+			return SS_UNRECOVERED_READ_ERROR;
+		if (type && type != fsg_cd_types[kind])
+			return SS_ILLEGAL_MODE_FOR_THIS_TRACK;
+		size += fsg_cd_main_size(kind, select) + fsg_cd_c2_size(select) +
+			fsg_cd_sub_size(sub);
+	}
+	if (size > U32_MAX)
+		return SS_INVALID_FIELD_IN_CDB;
+
+	common->data_size_from_cmnd = size;
+	return 0;
+}
+
+/* READ CD: the parts of each sector asked for, its C2 pointers, its subchannel */
+static int fsg_cd_read_cd(struct fsg_common *common)
+{
+	struct fsg_lun *curlun = common->curlun;
+	u8 type = (common->cmnd[1] >> 2) & 0x07;
+	u32 lba = get_unaligned_be32(&common->cmnd[2]);
+	u32 count = get_unaligned_be24(&common->cmnd[6]);
+	u8 select = common->cmnd[9], sub = common->cmnd[10] & 0x07;
+	struct fsg_cd_out out = { .left = common->data_size_from_cmnd };
+	u8 *raw, *subchannel;
+	u32 i, j;
+	int rc = 0;
+
+	if (!out.left)
+		return 0;
+
+	raw = kmalloc(2352 + 96, GFP_KERNEL);
+	if (!raw)
+		return -ENOMEM;
+	subchannel = raw + 2352;
+
+	for (i = 0; i < count && !rc; i++) {
+		u32 at = lba + i;
+		const struct fsg_cd_track *t = fsg_cd_track_of(curlun, at);
+		enum fsg_cd_kind kind;
+
+		if (fsg_cd_kind(curlun, t, at, type, &kind) ||
+		    (fsg_cd_main_size(kind, select) &&
+		     fsg_cd_raw(curlun, t, at, raw, select & FSG_CD_EDC_ECC))) {
+			fsg_cd_sense(curlun, SS_UNRECOVERED_READ_ERROR, at);
+			break;
+		}
+		for (j = 0; j < ARRAY_SIZE(fsg_cd_part_bits) && !rc; j++)
+			if (select & fsg_cd_part_bits[j])
+				rc = fsg_cd_put(common, &out,
+						raw + fsg_cd_parts[kind][j].at,
+						fsg_cd_parts[kind][j].len);
+		if (!rc)
+			rc = fsg_cd_put(common, &out, NULL, fsg_cd_c2_size(select));
+		if (!rc && sub) {
+			fsg_cd_subchannel(t, at, sub, subchannel);
+			rc = fsg_cd_put(common, &out, subchannel,
+					fsg_cd_sub_size(sub));
+		}
+		curlun->cd_position = at;
+	}
+	kfree(raw);
+	return rc ? rc : fsg_cd_put_end(&out);
+}
+
+/* One entry of the raw TOC, as the lead-in's Q subchannel has it */
+static u8 *fsg_cd_raw_toc_entry(u8 *p, u8 control, u8 point, u8 pmin, u8 psec,
+				u8 pframe)
+{
+	memset(p, 0, 11);
+	p[0] = 1;			/* Session */
+	p[1] = 0x10 | control;		/* ADR 1 */
+	p[3] = point;
+	p[8] = pmin;
+	p[9] = psec;
+	p[10] = pframe;
+	return p + 11;
+}
+
+static u8 *fsg_cd_raw_toc_address(u8 *p, u8 control, u8 point, u32 lba)
+{
+	u32 frames = lba + 150;
+
+	return fsg_cd_raw_toc_entry(p, control, point, frames / (60 * 75),
+				    frames / 75 % 60, frames % 75);
+}
+
+static u8 *fsg_cd_toc_entry(u8 *p, int msf, u8 control, u8 number, u32 lba)
+{
+	memset(p, 0, 8);
+	p[1] = 0x10 | control;		/* ADR 1 */
+	p[2] = number;
+	store_cdrom_address(&p[4], msf, lba);
+	return p + 8;
+}
+
+/* READ TOC of the tracks: formatted, the session, or raw */
+static int fsg_cd_read_toc(struct fsg_common *common, struct fsg_buffhd *bh,
+			   u8 format)
+{
+	struct fsg_lun *curlun = common->curlun;
+	const struct fsg_cd_track *tracks = curlun->tracks;
+	const struct fsg_cd_track *last = &tracks[curlun->num_tracks - 1];
+	int msf = common->cmnd[1] & 0x02;
+	u8 start_track = common->cmnd[6];
+	u8 *buf = (u8 *)bh->buf, *p = buf + 4;
+	bool xa = false;
+	unsigned int i;
+
+	for (i = 0; i < curlun->num_tracks; i++)
+		xa |= tracks[i].mode == 2;
+
+	switch (format) {
+	case 0:			/* Formatted TOC */
+		if (start_track > last->number && start_track != 0xaa) {
+			curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+			return -EINVAL;
+		}
+		buf[2] = tracks[0].number;
+		buf[3] = last->number;
+		for (i = 0; i < curlun->num_tracks; i++)
+			if (tracks[i].number >= start_track)
+				p = fsg_cd_toc_entry(p, msf, tracks[i].control,
+						     tracks[i].number,
+						     tracks[i].start);
+		p = fsg_cd_toc_entry(p, msf, last->control, 0xaa,
+				     curlun->num_sectors);
+		break;
+
+	case 1:			/* The first track of the last session */
+		buf[2] = 1;
+		buf[3] = 1;
+		p = fsg_cd_toc_entry(p, msf, tracks[0].control,
+				     tracks[0].number, tracks[0].start);
+		break;
+
+	case 2:			/* Raw TOC: A0, A1, A2, then the tracks */
+		buf[2] = 1;
+		buf[3] = 1;
+		p = fsg_cd_raw_toc_entry(p, tracks[0].control, 0xa0,
+					 tracks[0].number, xa ? 0x20 : 0, 0);
+		p = fsg_cd_raw_toc_entry(p, last->control, 0xa1, last->number,
+					 0, 0);
+		p = fsg_cd_raw_toc_address(p, last->control, 0xa2,
+					   curlun->num_sectors);
+		for (i = 0; i < curlun->num_tracks; i++)
+			p = fsg_cd_raw_toc_address(p, tracks[i].control,
+						   tracks[i].number,
+						   tracks[i].start);
+		break;
+
+	default:
+		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+		return -EINVAL;
+	}
+
+	put_unaligned_be16(p - buf - 2, buf);
+	return p - buf;
+}
+
+/*
+ * READ SUB-CHANNEL: where READ CD read last, with no audio playing; no
+ * media catalog number nor ISRC. A medium without tracks is one data track.
+ */
+static int do_read_subchannel(struct fsg_common *common, struct fsg_buffhd *bh)
+{
+	struct fsg_lun *curlun = common->curlun;
+	struct fsg_cd_track one = {
+		.end = curlun->num_sectors, .number = 1, .control = 0x4,
+		.mode = 1,
+	};
+	const struct fsg_cd_track *t = &one;
+	int msf = common->cmnd[1] & 0x02;
+	u8 format = common->cmnd[3];
+	u8 *buf = (u8 *)bh->buf;
+	u32 at = curlun->cd_position, rel;
+
+	if (format < 1 || format > 3) {
+		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+		return -EINVAL;
+	}
+	if (fsg_cd_has_tracks(curlun))
+		t = fsg_cd_track_of(curlun, at) ?: &curlun->tracks[0];
+	if (at >= t->end)
+		at = t->start;
+
+	memset(buf, 0, 24);
+	buf[1] = 0x15;			/* No current audio status */
+	if (!(common->cmnd[2] & 0x40))	/* Only the header */
+		return 4;
+
+	buf[4] = format;
+	switch (format) {
+	case 1:				/* Current position */
+		put_unaligned_be16(12, &buf[2]);
+		buf[5] = 0x10 | t->control;
+		buf[6] = t->number;
+		buf[7] = at < t->start ? 0 : 1;
+		store_cdrom_address(&buf[8], msf, at);
+		rel = at < t->start ? t->start - at : at - t->start;
+		if (msf) {
+			buf[13] = rel / (60 * 75);
+			buf[14] = rel / 75 % 60;
+			buf[15] = rel % 75;
+		} else {
+			put_unaligned_be32(at < t->start ? -rel : rel,
+					   &buf[12]);
+		}
+		return 16;
+	case 3:				/* ISRC of a track */
+		buf[5] = 0x10 | t->control;
+		buf[6] = common->cmnd[6];
+		fallthrough;
+	default:			/* Media catalog number */
+		put_unaligned_be16(20, &buf[2]);
+		return 24;
+	}
+}
+
+/*-------------------------------------------------------------------------*/
+
 static int do_read(struct fsg_common *common)
 {
 	struct fsg_lun		*curlun = common->curlun;
@@ -651,6 +1276,8 @@ static int do_read(struct fsg_common *common)
 	amount_left = common->data_size_from_cmnd;
 	if (unlikely(amount_left == 0))
 		return -EIO;		/* No default reply */
+	if (fsg_cd_has_tracks(curlun))
+		return fsg_cd_read_data(common, lba);
 
 	for (;;) {
 		/*
@@ -1201,6 +1828,15 @@ static int do_read_header(struct fsg_common *common, struct fsg_buffhd *bh)
 
 	memset(buf, 0, 8);
 	buf[0] = 0x01;		/* 2048 bytes of user data, rest is EC */
+	if (fsg_cd_has_tracks(curlun)) {
+		const struct fsg_cd_track *t = fsg_cd_track_of(curlun, lba);
+
+		if (!t->mode) {
+			curlun->sense_data = SS_ILLEGAL_MODE_FOR_THIS_TRACK;
+			return -EINVAL;
+		}
+		buf[0] = t->mode;
+	}
 	store_cdrom_address(&buf[4], msf, lba);
 	return 8;
 }
@@ -1217,7 +1853,8 @@ static int do_read_toc(struct fsg_common *common, struct fsg_buffhd *bh)
 	format = common->cmnd[2] & 0xf;
 
 	if ((common->cmnd[1] & ~0x02) != 0 ||	/* Mask away MSF */
-			(start_track > 1 && format != 0x1)) {
+			(start_track > 1 && format != 0x1 &&
+			 !fsg_cd_has_tracks(curlun))) {
 		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
 		return -EINVAL;
 	}
@@ -1229,6 +1866,9 @@ static int do_read_toc(struct fsg_common *common, struct fsg_buffhd *bh)
 	 */
 	if (format == 0)
 		format = (common->cmnd[9] >> 6) & 0x3;
+
+	if (fsg_cd_has_tracks(curlun))
+		return fsg_cd_read_toc(common, bh, format);
 
 	switch (format) {
 	case 0:	/* Formatted TOC */
@@ -1366,8 +2006,10 @@ static int do_get_configuration(struct fsg_common *common,
 		p += 8;
 	}
 	if (FSG_WANT(0x001e, profile == FSG_MMC_PROFILE_CD_ROM)) { /* CD Read */
-		p = fsg_feature(p, 0x001e, 0, false,
-				profile == FSG_MMC_PROFILE_CD_ROM, 0);
+		p = fsg_feature(p, 0x001e, 2, false,
+				profile == FSG_MMC_PROFILE_CD_ROM, 4);
+		p[0] = 0x02;		/* C2 error pointers */
+		p += 4;
 	}
 	if (FSG_WANT(0x001f, profile == FSG_MMC_PROFILE_DVD_ROM)) { /* DVD Read */
 		p = fsg_feature(p, 0x001f, 0, false,
@@ -1446,29 +2088,80 @@ static int do_read_disc_structure(struct fsg_common *common,
 	return -EINVAL;
 }
 
-/* One closed session with one data track, the medium's only one */
+/* One closed session: its tracks, or the medium's only data track */
 static int do_read_disc_information(struct fsg_common *common,
 				    struct fsg_buffhd *bh)
 {
 	struct fsg_lun	*curlun = common->curlun;
 	u8		*buf = (u8 *)bh->buf;
+	u8		first = 1, last = 1, type = 0;
+	unsigned int	i;
 
 	if ((common->cmnd[1] & 0x07) != 0) {	/* Standard information only */
 		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
 		return -EINVAL;
 	}
+	if (fsg_cd_has_tracks(curlun)) {
+		first = curlun->tracks[0].number;
+		last = curlun->tracks[curlun->num_tracks - 1].number;
+		for (i = 0; i < curlun->num_tracks; i++)
+			if (curlun->tracks[i].mode == 2)
+				type = 0x20;	/* CD-ROM XA */
+	}
 
 	memset(buf, 0, 34);
 	put_unaligned_be16(32, buf);
 	buf[2] = 0x0e;		/* Last session complete, disc complete */
-	buf[3] = 1;		/* First track */
+	buf[3] = first;		/* First track */
 	buf[4] = 1;		/* Sessions */
-	buf[5] = 1;		/* First track in the last session */
-	buf[6] = 1;		/* Last track in the last session */
+	buf[5] = first;		/* First track in the last session */
+	buf[6] = last;		/* Last track in the last session */
 	buf[7] = 0x20;		/* Unrestricted use */
+	buf[8] = type;		/* CD-DA or CD-ROM, or CD-ROM XA */
 	put_unaligned_be32(0xffffffff, &buf[16]);	/* No next session */
 	put_unaligned_be32(0xffffffff, &buf[20]);	/* No next lead-out */
 	return 34;
+}
+
+/* A track by a sector in it, by its number, or the first of session 1 */
+static int fsg_cd_read_track_information(struct fsg_common *common,
+					 struct fsg_buffhd *bh, u32 address)
+{
+	struct fsg_lun *curlun = common->curlun;
+	const struct fsg_cd_track *t = NULL;
+	u8 *buf = (u8 *)bh->buf;
+	unsigned int i;
+
+	switch (common->cmnd[1] & 0x03) {
+	case 0:			/* By block */
+		if (address < curlun->num_sectors)
+			t = fsg_cd_track_of(curlun, address);
+		break;
+	case 1:			/* By track */
+		for (i = 0; i < curlun->num_tracks; i++)
+			if (curlun->tracks[i].number == address)
+				t = &curlun->tracks[i];
+		break;
+	case 2:			/* By session */
+		if (address == 1)
+			t = &curlun->tracks[0];
+		break;
+	}
+	if (!t) {
+		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
+		return -EINVAL;
+	}
+
+	memset(buf, 0, 36);
+	put_unaligned_be16(34, buf);
+	buf[2] = t->number;
+	buf[3] = 1;		/* Session */
+	buf[5] = t->control;	/* Track mode */
+	buf[6] = t->mode ?: 0x0f;	/* Data mode, unknown for audio */
+	put_unaligned_be32(t->start, &buf[8]);
+	put_unaligned_be32(t->end - t->start, &buf[24]);
+	put_unaligned_be32(t->end - 1, &buf[28]);
+	return 36;
 }
 
 static int do_read_track_information(struct fsg_common *common,
@@ -1478,6 +2171,9 @@ static int do_read_track_information(struct fsg_common *common,
 	u8		*buf = (u8 *)bh->buf;
 	u32		address = get_unaligned_be32(&common->cmnd[2]);
 	bool		track1;
+
+	if (fsg_cd_has_tracks(curlun))
+		return fsg_cd_read_track_information(common, bh, address);
 
 	switch (common->cmnd[1] & 0x03) {
 	case 0:			/* By block */
@@ -1601,6 +2297,8 @@ static int do_mode_sense(struct fsg_common *common, struct fsg_buffhd *bh)
 
 		if (!changeable_values) {
 			buf[2] = 0x08;	/* Reads DVD-ROM, as well as CD */
+			buf[4] = 0x30;	/* Mode 2 form 1 and form 2 */
+			buf[5] = 0x13;	/* CD-DA by READ CD, accurately, C2 */
 			buf[6] = 0x29 | (curlun->prevent_medium_removal << 1);
 					/* Tray, eject, lock and its state */
 			put_unaligned_be16(2816, &buf[8]);	/* 16x, KB/s */
@@ -2317,6 +3015,21 @@ static int do_scsi_command(struct fsg_common *common)
 	case GPCMD_READ_CD:
 		if (!common->curlun || !common->curlun->cdrom)
 			goto unknown_cmnd;
+		if (fsg_cd_has_tracks(common->curlun)) {
+			u32 bad = 0;
+			u32 sense = fsg_cd_read_cd_size(common, &bad);
+
+			reply = check_command(common, 12, DATA_DIR_TO_HOST,
+					      (1<<1) | (0xf<<2) | (7<<6) |
+					      (1<<9) | (1<<10), 1, "READ CD");
+			if (reply == 0 && sense) {
+				fsg_cd_sense(common->curlun, sense, bad);
+				reply = -EINVAL;
+			} else if (reply == 0) {
+				reply = fsg_cd_read_cd(common);
+			}
+			break;
+		}
 		common->data_size_from_cmnd =
 			get_unaligned_be24(&common->cmnd[6]);
 		reply = check_command_size_in_blocks(common, 12,
@@ -2326,6 +3039,18 @@ static int do_scsi_command(struct fsg_common *common)
 				      "READ CD");
 		if (reply == 0)
 			reply = do_read_cd(common);
+		break;
+
+	case GPCMD_READ_SUBCHANNEL:
+		if (!common->curlun || !common->curlun->cdrom)
+			goto unknown_cmnd;
+		common->data_size_from_cmnd =
+			get_unaligned_be16(&common->cmnd[7]);
+		reply = check_command(common, 10, DATA_DIR_TO_HOST,
+				      (1<<1) | (1<<2) | (1<<3) | (1<<6) |
+				      (3<<7), 1, "READ SUB-CHANNEL");
+		if (reply == 0)
+			reply = do_read_subchannel(common, bh);
 		break;
 
 	case READ_HEADER:
@@ -3580,6 +4305,26 @@ static ssize_t fsg_lun_opts_profile_store(struct config_item *item,
 
 CONFIGFS_ATTR(fsg_lun_opts_, profile);
 
+static ssize_t fsg_lun_opts_tracks_show(struct config_item *item, char *page)
+{
+	struct fsg_lun_opts *opts = to_fsg_lun_opts(item);
+	struct fsg_opts *fsg_opts = to_fsg_opts(opts->group.cg_item.ci_parent);
+
+	return fsg_show_tracks(opts->lun, &fsg_opts->common->filesem, page);
+}
+
+static ssize_t fsg_lun_opts_tracks_store(struct config_item *item,
+					 const char *page, size_t len)
+{
+	struct fsg_lun_opts *opts = to_fsg_lun_opts(item);
+	struct fsg_opts *fsg_opts = to_fsg_opts(opts->group.cg_item.ci_parent);
+
+	return fsg_store_tracks(opts->lun, &fsg_opts->common->filesem, page,
+				len);
+}
+
+CONFIGFS_ATTR(fsg_lun_opts_, tracks);
+
 static ssize_t fsg_lun_opts_nofua_show(struct config_item *item, char *page)
 {
 	return fsg_show_nofua(to_fsg_lun_opts(item)->lun, page);
@@ -3625,6 +4370,7 @@ static struct configfs_attribute *fsg_lun_attrs[] = {
 	&fsg_lun_opts_attr_removable,
 	&fsg_lun_opts_attr_cdrom,
 	&fsg_lun_opts_attr_profile,
+	&fsg_lun_opts_attr_tracks,
 	&fsg_lun_opts_attr_nofua,
 	&fsg_lun_opts_attr_inquiry_string,
 	&fsg_lun_opts_attr_forced_eject,
