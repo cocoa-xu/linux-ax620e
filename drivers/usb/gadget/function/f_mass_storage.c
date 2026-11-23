@@ -926,13 +926,23 @@ static int fsg_cd_put(struct fsg_common *common, struct fsg_cd_out *out,
 	return 0;
 }
 
-/* The last buffer is for finish_reply to send */
-static int fsg_cd_put_end(struct fsg_cd_out *out)
+/*
+ * The last buffer is for finish_reply to send, an empty one when nothing
+ * went in, as do_read leaves it.
+ */
+static int fsg_cd_put_end(struct fsg_common *common, struct fsg_cd_out *out)
 {
-	if (out->bh) {
-		out->bh->inreq->length = out->used;
-		out->bh->state = BUF_STATE_FULL;
+	int rc;
+
+	if (!out->bh) {
+		out->bh = common->next_buffhd_to_fill;
+		rc = sleep_thread(common, false, out->bh);
+		if (rc)
+			return rc;
+		out->used = 0;
 	}
+	out->bh->inreq->length = out->used;
+	out->bh->state = BUF_STATE_FULL;
 	return -EIO;		/* No default reply */
 }
 
@@ -988,7 +998,7 @@ static int fsg_cd_read_data(struct fsg_common *common, u32 lba)
 		rc = fsg_cd_put(common, &out, buf, 2048);
 	}
 	kfree(buf);
-	return rc ? rc : fsg_cd_put_end(&out);
+	return rc ? rc : fsg_cd_put_end(common, &out);
 }
 
 /*
@@ -1077,7 +1087,7 @@ static int fsg_cd_read_cd(struct fsg_common *common)
 		curlun->cd_position = at;
 	}
 	kfree(raw);
-	return rc ? rc : fsg_cd_put_end(&out);
+	return rc ? rc : fsg_cd_put_end(common, &out);
 }
 
 /* One entry of the raw TOC, as the lead-in's Q subchannel has it */
