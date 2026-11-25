@@ -13,6 +13,7 @@
 #include <linux/v4l2-controls.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-h264-enc.h>
+#include <media/v4l2-hevc-enc.h>
 #include <media/v4l2-vp9.h>
 #include <media/videobuf2-core.h>
 
@@ -85,6 +86,12 @@ struct hantro_h264_enc_hw_ctx {
 	union {
 		struct hantro_vc8000e_regs vc8000e_regs;
 	};
+};
+
+struct hantro_hevc_enc_hw_ctx {
+	struct v4l2_hevc_enc enc;
+	struct hantro_aux_buf nal_tbl;
+	struct hantro_vc8000e_regs vc8000e_regs;
 };
 
 /* Max. number of entries in the DPB (HW limitation). */
@@ -481,6 +488,10 @@ int hantro_vc8000e_h264_enc_init(struct hantro_ctx *ctx);
 void hantro_vc8000e_h264_enc_exit(struct hantro_ctx *ctx);
 void hantro_vc8000e_h264_enc_done(struct hantro_ctx *ctx);
 int hantro_vc8000e_h264_enc_run(struct hantro_ctx *ctx);
+int hantro_vc8000e_hevc_enc_init(struct hantro_ctx *ctx);
+void hantro_vc8000e_hevc_enc_exit(struct hantro_ctx *ctx);
+void hantro_vc8000e_hevc_enc_done(struct hantro_ctx *ctx);
+int hantro_vc8000e_hevc_enc_run(struct hantro_ctx *ctx);
 int hantro_h264_enc_prepare_run(struct hantro_ctx *ctx);
 int hantro_h264_enc_init(struct hantro_ctx *ctx);
 void hantro_h264_enc_exit(struct hantro_ctx *ctx);

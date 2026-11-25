@@ -567,6 +567,61 @@ static const struct hantro_ctrl controls[] = {
 		},
 	},
 
+	/* HEVC Encoder */
+
+	{
+		.codec = HANTRO_HEVC_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_HEVC_ENCODE_PARAMS,
+		},
+	}, {
+		.codec = HANTRO_HEVC_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_HEVC_SPS,
+		},
+	}, {
+		.codec = HANTRO_HEVC_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_STATELESS_HEVC_PPS,
+		},
+	}, {
+		.codec = HANTRO_HEVC_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP,
+			.step = 1,
+			.min = 0,
+			.max = 51,
+			.def = 0,
+		},
+	}, {
+		.codec = HANTRO_HEVC_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP,
+			.step = 1,
+			.min = 0,
+			.max = 51,
+			.def = 51,
+		},
+	}, {
+		.codec = HANTRO_HEVC_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP,
+			.step = 1,
+			.min = 0,
+			.max = 51,
+			.def = 26,
+		},
+	}, {
+		.codec = HANTRO_HEVC_ENCODER,
+		.cfg = {
+			.id = V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP,
+			.step = 1,
+			.min = 0,
+			.max = 51,
+			.def = 28,
+		},
+	},
+
 	/* MPEG-2 Decoder */
 
 	{
