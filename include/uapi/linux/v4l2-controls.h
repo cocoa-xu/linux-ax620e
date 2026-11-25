@@ -2144,6 +2144,7 @@ struct v4l2_ctrl_mpeg2_quantisation {
 #define V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS (V4L2_CID_CODEC_STATELESS_BASE + 407)
 #define V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS  (V4L2_CID_CODEC_STATELESS_BASE + 408)
 #define V4L2_CID_STATELESS_HEVC_EXT_SPS_LT_RPS  (V4L2_CID_CODEC_STATELESS_BASE + 409)
+#define V4L2_CID_STATELESS_HEVC_ENCODE_PARAMS	(V4L2_CID_CODEC_STATELESS_BASE + 410)
 
 enum v4l2_stateless_hevc_decode_mode {
 	V4L2_STATELESS_HEVC_DECODE_MODE_SLICE_BASED,
@@ -2656,6 +2657,35 @@ struct v4l2_ctrl_hevc_ext_sps_st_rps {
 struct v4l2_ctrl_hevc_ext_sps_lt_rps {
 	__u16	lt_ref_pic_poc_lsb_sps;
 	__u16	flags;
+};
+
+#define V4L2_HEVC_ENCODE_FLAG_IDR_PIC				0x01
+#define V4L2_HEVC_ENCODE_FLAG_NO_OUTPUT_OF_PRIOR_PICS		0x02
+#define V4L2_HEVC_ENCODE_FLAG_SLICE_SAO_LUMA			0x04
+#define V4L2_HEVC_ENCODE_FLAG_SLICE_SAO_CHROMA			0x08
+#define V4L2_HEVC_ENCODE_FLAG_CABAC_INIT			0x10
+#define V4L2_HEVC_ENCODE_FLAG_SLICE_DEBLOCKING_FILTER_DISABLED	0x20
+
+/**
+ * struct v4l2_ctrl_hevc_encode_params - HEVC encode parameters
+ *
+ * The picture to encode, as a single slice segment. The encoder writes the
+ * parameter sets from the HEVC SPS and PPS controls, used as templates, and
+ * takes the slice QP from the HEVC frame QP controls.
+ *
+ * @slice_type: see V4L2_HEVC_SLICE_TYPE_{}
+ * @pic_parameter_set_id: identifies the picture parameter set in use
+ * @slice_pic_order_cnt_lsb: picture order count modulo MaxPicOrderCntLsb,
+ *			     0 for IDR pictures
+ * @reserved: padding field. Should be zeroed by applications.
+ * @flags: see V4L2_HEVC_ENCODE_FLAG_{}
+ */
+struct v4l2_ctrl_hevc_encode_params {
+	__u8	slice_type;
+	__u8	pic_parameter_set_id;
+	__u16	slice_pic_order_cnt_lsb;
+	__u8	reserved[4];
+	__u64	flags;
 };
 
 /* Stateless VP9 controls */

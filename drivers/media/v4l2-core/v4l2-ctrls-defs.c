@@ -1234,6 +1234,7 @@ const char *v4l2_ctrl_get_name(u32 id)
 	case V4L2_CID_STATELESS_HEVC_SLICE_PARAMS:		return "HEVC Slice Parameters";
 	case V4L2_CID_STATELESS_HEVC_SCALING_MATRIX:		return "HEVC Scaling Matrix";
 	case V4L2_CID_STATELESS_HEVC_DECODE_PARAMS:		return "HEVC Decode Parameters";
+	case V4L2_CID_STATELESS_HEVC_ENCODE_PARAMS:		return "HEVC Encode Parameters";
 	case V4L2_CID_STATELESS_HEVC_DECODE_MODE:		return "HEVC Decode Mode";
 	case V4L2_CID_STATELESS_HEVC_START_CODE:		return "HEVC Start Code";
 	case V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS:	return "HEVC Entry Point Offsets";
@@ -1584,6 +1585,9 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 		break;
 	case V4L2_CID_STATELESS_HEVC_DECODE_PARAMS:
 		*type = V4L2_CTRL_TYPE_HEVC_DECODE_PARAMS;
+		break;
+	case V4L2_CID_STATELESS_HEVC_ENCODE_PARAMS:
+		*type = V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS;
 		break;
 	case V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS:
 		*type = V4L2_CTRL_TYPE_U32;

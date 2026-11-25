@@ -115,6 +115,7 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	struct v4l2_ctrl_fwht_params *p_fwht_params;
 	struct v4l2_ctrl_h264_scaling_matrix *p_h264_scaling_matrix;
 	struct v4l2_ctrl_av1_sequence *p_av1_sequence;
+	struct v4l2_ctrl_hevc_encode_params *p_hevc_encode_params;
 	void *p = ptr.p + idx * ctrl->elem_size;
 
 	if (ctrl->p_def.p_const)
@@ -153,6 +154,11 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	case V4L2_CTRL_TYPE_VP8_FRAME:
 		p_vp8_frame = p;
 		p_vp8_frame->num_dct_parts = 1;
+		break;
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS:
+		p_hevc_encode_params = p;
+		p_hevc_encode_params->slice_type = V4L2_HEVC_SLICE_TYPE_I;
+		p_hevc_encode_params->flags = V4L2_HEVC_ENCODE_FLAG_IDR_PIC;
 		break;
 	case V4L2_CTRL_TYPE_VP9_FRAME:
 		p_vp9_frame = p;
@@ -441,6 +447,9 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CTRL_TYPE_HEVC_DECODE_PARAMS:
 		pr_cont("HEVC_DECODE_PARAMS");
+		break;
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS:
+		pr_cont("HEVC_ENCODE_PARAMS");
 		break;
 	case V4L2_CTRL_TYPE_AV1_SEQUENCE:
 		pr_cont("AV1_SEQUENCE");
@@ -1001,6 +1010,7 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	struct v4l2_ctrl_hevc_slice_params *p_hevc_slice_params;
 	struct v4l2_ctrl_hdr10_mastering_display *p_hdr10_mastering;
 	struct v4l2_ctrl_hevc_decode_params *p_hevc_decode_params;
+	struct v4l2_ctrl_hevc_encode_params *p_hevc_encode_params;
 	struct v4l2_area *area;
 	struct v4l2_rect *rect;
 	void *p = ptr.p + idx * ctrl->elem_size;
@@ -1393,6 +1403,35 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 
 		if (p_hevc_lt_rps->flags & ~V4L2_HEVC_EXT_SPS_LT_RPS_FLAG_USED_LT)
 			return -EINVAL;
+		break;
+
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS:
+		p_hevc_encode_params = p;
+
+		if (p_hevc_encode_params->slice_type > V4L2_HEVC_SLICE_TYPE_I)
+			return -EINVAL;
+		if (p_hevc_encode_params->flags &
+		    ~(V4L2_HEVC_ENCODE_FLAG_IDR_PIC |
+		      V4L2_HEVC_ENCODE_FLAG_NO_OUTPUT_OF_PRIOR_PICS |
+		      V4L2_HEVC_ENCODE_FLAG_SLICE_SAO_LUMA |
+		      V4L2_HEVC_ENCODE_FLAG_SLICE_SAO_CHROMA |
+		      V4L2_HEVC_ENCODE_FLAG_CABAC_INIT |
+		      V4L2_HEVC_ENCODE_FLAG_SLICE_DEBLOCKING_FILTER_DISABLED))
+			return -EINVAL;
+
+		if (p_hevc_encode_params->flags & V4L2_HEVC_ENCODE_FLAG_IDR_PIC) {
+			if (p_hevc_encode_params->slice_type != V4L2_HEVC_SLICE_TYPE_I)
+				return -EINVAL;
+			p_hevc_encode_params->slice_pic_order_cnt_lsb = 0;
+		} else {
+			p_hevc_encode_params->flags &=
+				~V4L2_HEVC_ENCODE_FLAG_NO_OUTPUT_OF_PRIOR_PICS;
+		}
+
+		if (p_hevc_encode_params->slice_type == V4L2_HEVC_SLICE_TYPE_I)
+			p_hevc_encode_params->flags &= ~V4L2_HEVC_ENCODE_FLAG_CABAC_INIT;
+
+		zero_reserved(*p_hevc_encode_params);
 		break;
 
 	case V4L2_CTRL_TYPE_HDR10_CLL_INFO:
@@ -2177,6 +2216,9 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
 		break;
 	case V4L2_CTRL_TYPE_HEVC_DECODE_PARAMS:
 		elem_size = sizeof(struct v4l2_ctrl_hevc_decode_params);
+		break;
+	case V4L2_CTRL_TYPE_HEVC_ENCODE_PARAMS:
+		elem_size = sizeof(struct v4l2_ctrl_hevc_encode_params);
 		break;
 	case V4L2_CTRL_TYPE_HDR10_CLL_INFO:
 		elem_size = sizeof(struct v4l2_ctrl_hdr10_cll_info);
