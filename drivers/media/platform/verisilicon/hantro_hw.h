@@ -476,6 +476,7 @@ int hantro_h264_dec_init(struct hantro_ctx *ctx);
 void hantro_h264_dec_exit(struct hantro_ctx *ctx);
 
 irqreturn_t hantro_vc8000e_irq(int irq, void *dev_id);
+void hantro_vc8000e_areas_disable(struct hantro_vc8000e_regs *regs);
 int hantro_vc8000e_h264_enc_init(struct hantro_ctx *ctx);
 void hantro_vc8000e_h264_enc_exit(struct hantro_ctx *ctx);
 void hantro_vc8000e_h264_enc_done(struct hantro_ctx *ctx);
