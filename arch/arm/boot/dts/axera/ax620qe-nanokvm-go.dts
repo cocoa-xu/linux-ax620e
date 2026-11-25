@@ -53,6 +53,10 @@
 		};
 	};
 
+	/*
+	 * The Go+'s 512 MiB. U-Boot gives the DRAM the chip has, 256 MiB on
+	 * the Go, and sizes the CMA pools below for it.
+	 */
 	memory@40000000 {
 		device_type = "memory";
 		reg = <0x40000000 0x20000000>;
@@ -63,8 +67,9 @@
 		#size-cells = <1>;
 		ranges;
 
-		ramlog@55f00000 {
-			reg = <0x55f00000 0x100000>;
+		/* The top MiB of the first 256: in the DRAM of both boards. */
+		ramlog@4ff00000 {
+			reg = <0x4ff00000 0x100000>;
 			no-map;
 		};
 
