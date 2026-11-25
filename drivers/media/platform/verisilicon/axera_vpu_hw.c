@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Hantro VPU codec driver: Axera AX620E JPEG and H.264 encoders
+ * Hantro VPU codec driver: Axera AX620E JPEG, H.264 and HEVC encoders
  *
  * Two VeriSilicon VC8000E cores, one in JPEG-only configuration (JENC) and
  * one for H.264 and HEVC (VENC). Their registers sit behind a VCMD command
@@ -94,6 +94,11 @@ static const struct hantro_fmt ax620e_venc_fmts[] = {
 		.codec_mode = HANTRO_MODE_H264_ENC,
 		.max_depth = 2,
 		.frmsize = AX620E_VENC_FRMSIZE,
+	}, {
+		.fourcc = V4L2_PIX_FMT_HEVC_SLICE,
+		.codec_mode = HANTRO_MODE_HEVC_ENC,
+		.max_depth = 2,
+		.frmsize = AX620E_VENC_FRMSIZE,
 	},
 };
 
@@ -104,6 +109,13 @@ static const struct hantro_codec_ops ax620e_venc_codec_ops[] = {
 		.done = hantro_vc8000e_h264_enc_done,
 		.init = hantro_vc8000e_h264_enc_init,
 		.exit = hantro_vc8000e_h264_enc_exit,
+	},
+	[HANTRO_MODE_HEVC_ENC] = {
+		.run = hantro_vc8000e_hevc_enc_run,
+		.reset = hantro_vc8000e_reset,
+		.done = hantro_vc8000e_hevc_enc_done,
+		.init = hantro_vc8000e_hevc_enc_init,
+		.exit = hantro_vc8000e_hevc_enc_exit,
 	},
 };
 
@@ -117,7 +129,7 @@ const struct hantro_variant ax620e_venc_variant = {
 	.enc_offset = 0x1000,
 	.enc_fmts = ax620e_venc_fmts,
 	.num_enc_fmts = ARRAY_SIZE(ax620e_venc_fmts),
-	.codec = HANTRO_H264_ENCODER,
+	.codec = HANTRO_H264_ENCODER | HANTRO_HEVC_ENCODER,
 	.codec_ops = ax620e_venc_codec_ops,
 	.irqs = ax620e_venc_irqs,
 	.num_irqs = ARRAY_SIZE(ax620e_venc_irqs),
