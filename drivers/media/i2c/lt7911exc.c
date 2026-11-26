@@ -65,7 +65,13 @@
 #define  FLASH_PROG_IDLE		0x00
 #define  FLASH_PROG_WRITE		0x01
 #define  FLASH_PROG_FIFO_RESET		0x08
-#define REG_FLASH_ENABLE		CCI_REG8(0xe0ee)
+
+/*
+ * While set, the host reaches the chip's own registers: the flash controller
+ * above and the other pages, which read as zeros without it. The firmware's
+ * registers on page 0xe0 answer either way.
+ */
+#define REG_HOST_ACCESS			CCI_REG8(0xe0ee)
 
 #define SPI_NOR_WREN			0x06
 #define SPI_NOR_READ			0x03
@@ -149,8 +155,8 @@ struct lt7911exc {
 	struct v4l2_dv_timings detected;
 	struct v4l2_dv_timings timings;
 
-	/* Serializes the flash accesses and protects the EDID copy. */
-	struct mutex flash_lock;
+	/* Serializes the host's register accesses and protects the EDID copy. */
+	struct mutex access_lock;
 	u8 edid[LT7911EXC_EDID_SIZE];
 	/* Blocks in edid[], 0 until the flash has been read. */
 	unsigned int edid_blocks;
@@ -320,7 +326,7 @@ static int lt7911exc_flash_program(struct lt7911exc *lt, u32 addr,
 	for (off = 0; off < len; off += LT7911EXC_FLASH_PAGE) {
 		u32 page = addr + off;
 
-		cci_write(lt->regmap, REG_FLASH_ENABLE, 1, &ret);
+		cci_write(lt->regmap, REG_HOST_ACCESS, 1, &ret);
 		cci_write(lt->regmap, REG_FLASH_PROG, FLASH_PROG_WRITE, &ret);
 		cci_write(lt->regmap, REG_FLASH_ADDR_H, (page >> 16) & 0xff,
 			  &ret);
@@ -336,6 +342,14 @@ static int lt7911exc_flash_program(struct lt7911exc *lt, u32 addr,
 	}
 
 	return 0;
+}
+
+/* Ends the host's register access, also after a failed one. */
+static int lt7911exc_end_host_access(struct lt7911exc *lt, int ret)
+{
+	int err = cci_write(lt->regmap, REG_HOST_ACCESS, 0, NULL);
+
+	return ret ?: err;
 }
 
 static unsigned int lt7911exc_edid_blocks(const u8 *edid)
@@ -366,7 +380,7 @@ static bool lt7911exc_edid_valid(const u8 *edid, unsigned int blocks)
 	return true;
 }
 
-/* Called with flash_lock held and the interrupt disabled. */
+/* Called with access_lock held and the interrupt disabled. */
 static int lt7911exc_load_edid(struct lt7911exc *lt)
 {
 	int ret = 0;
@@ -374,11 +388,11 @@ static int lt7911exc_load_edid(struct lt7911exc *lt)
 	if (lt->edid_blocks)
 		return 0;
 
-	cci_write(lt->regmap, REG_FLASH_ENABLE, 1, &ret);
+	cci_write(lt->regmap, REG_HOST_ACCESS, 1, &ret);
 	if (!ret)
 		ret = lt7911exc_flash_read(lt, LT7911EXC_EDID_ADDR, lt->edid,
 					   sizeof(lt->edid));
-	cci_write(lt->regmap, REG_FLASH_ENABLE, 0, &ret);
+	ret = lt7911exc_end_host_access(lt, ret);
 	if (ret)
 		return ret;
 
@@ -387,7 +401,7 @@ static int lt7911exc_load_edid(struct lt7911exc *lt)
 	return lt->edid_blocks ? 0 : -ENODATA;
 }
 
-/* Called with flash_lock held and the interrupt disabled. */
+/* Called with access_lock held and the interrupt disabled. */
 static int lt7911exc_store_edid(struct lt7911exc *lt, const u8 *edid,
 				unsigned int blocks)
 {
@@ -396,7 +410,7 @@ static int lt7911exc_store_edid(struct lt7911exc *lt, const u8 *edid,
 
 	lt->edid_blocks = 0;
 
-	cci_write(lt->regmap, REG_FLASH_ENABLE, 1, &ret);
+	cci_write(lt->regmap, REG_HOST_ACCESS, 1, &ret);
 	if (!ret)
 		ret = lt7911exc_flash_erase_edid(lt);
 	if (!ret)
@@ -405,7 +419,7 @@ static int lt7911exc_store_edid(struct lt7911exc *lt, const u8 *edid,
 	if (!ret)
 		ret = lt7911exc_flash_read(lt, LT7911EXC_EDID_ADDR, lt->edid,
 					   sizeof(lt->edid));
-	cci_write(lt->regmap, REG_FLASH_ENABLE, 0, &ret);
+	ret = lt7911exc_end_host_access(lt, ret);
 	if (ret)
 		return ret;
 
@@ -424,12 +438,12 @@ static void lt7911exc_flash_begin(struct lt7911exc *lt)
 	/* The firmware must not see the host in the middle of an access. */
 	if (lt->irq > 0)
 		disable_irq(lt->irq);
-	mutex_lock(&lt->flash_lock);
+	mutex_lock(&lt->access_lock);
 }
 
 static void lt7911exc_flash_end(struct lt7911exc *lt)
 {
-	mutex_unlock(&lt->flash_lock);
+	mutex_unlock(&lt->access_lock);
 	if (lt->irq > 0)
 		enable_irq(lt->irq);
 }
@@ -786,7 +800,7 @@ static int lt7911exc_probe(struct i2c_client *client)
 	if (!lt)
 		return -ENOMEM;
 
-	ret = devm_mutex_init(dev, &lt->flash_lock);
+	ret = devm_mutex_init(dev, &lt->access_lock);
 	if (ret)
 		return ret;
 
