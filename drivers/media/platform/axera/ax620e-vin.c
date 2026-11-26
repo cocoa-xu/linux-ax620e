@@ -824,10 +824,51 @@ static void ax_vin_fill_fmt(struct v4l2_pix_format *pix)
 	pix->field = V4L2_FIELD_NONE;
 	pix->bytesperline = ALIGN(pix->width * 2, AX_VIN_STRIDE_ALIGN);
 	pix->sizeimage = pix->bytesperline * pix->height;
-	pix->colorspace = V4L2_COLORSPACE_REC709;
-	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
-	pix->quantization = V4L2_QUANTIZATION_DEFAULT;
-	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+	pix->flags &= V4L2_PIX_FMT_FLAG_SET_CSC;
+}
+
+static void ax_vin_copy_colour(struct v4l2_pix_format *pix,
+			       const struct v4l2_mbus_framefmt *mbus)
+{
+	pix->colorspace = mbus->colorspace;
+	pix->ycbcr_enc = mbus->ycbcr_enc;
+	pix->quantization = mbus->quantization;
+	pix->xfer_func = mbus->xfer_func;
+}
+
+/*
+ * The colour of the picture is the source's. With V4L2_PIX_FMT_FLAG_SET_CSC
+ * it converts to the encoding and the range asked for if it can; a try only
+ * tells what it would do.
+ */
+static void ax_vin_colour(struct ax_vin *vin, struct v4l2_pix_format *pix,
+			  enum v4l2_subdev_format_whence which)
+{
+	struct v4l2_subdev_format fmt = { .which = which };
+	int ret = -ENODEV;
+
+	if (pix->flags & V4L2_PIX_FMT_FLAG_SET_CSC) {
+		fmt.format.flags = V4L2_MBUS_FRAMEFMT_SET_CSC;
+		fmt.format.ycbcr_enc = pix->ycbcr_enc;
+		fmt.format.quantization = pix->quantization;
+	}
+
+	if (vin->source && which == V4L2_SUBDEV_FORMAT_TRY)
+		ret = v4l2_subdev_call_state_try(vin->source, pad, set_fmt,
+						 &fmt);
+	else if (vin->source)
+		ret = v4l2_subdev_call_state_active(vin->source, pad, set_fmt,
+						    &fmt);
+
+	if (ret) {
+		pix->colorspace = V4L2_COLORSPACE_REC709;
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+		pix->quantization = V4L2_QUANTIZATION_DEFAULT;
+		pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+		return;
+	}
+
+	ax_vin_copy_colour(pix, &fmt.format);
 }
 
 static int ax_vin_querycap(struct file *file, void *priv,
@@ -842,10 +883,23 @@ static int ax_vin_querycap(struct file *file, void *priv,
 static int ax_vin_enum_fmt(struct file *file, void *priv,
 			   struct v4l2_fmtdesc *f)
 {
+	struct ax_vin *vin = video_drvdata(file);
+	struct v4l2_subdev_mbus_code_enum code = {
+		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+	};
+
 	if (f->index)
 		return -EINVAL;
 
 	f->pixelformat = V4L2_PIX_FMT_YUYV;
+	if (vin->source &&
+	    !v4l2_subdev_call_state_active(vin->source, pad, enum_mbus_code,
+					   &code)) {
+		if (code.flags & V4L2_SUBDEV_MBUS_CODE_CSC_YCBCR_ENC)
+			f->flags |= V4L2_FMT_FLAG_CSC_YCBCR_ENC;
+		if (code.flags & V4L2_SUBDEV_MBUS_CODE_CSC_QUANTIZATION)
+			f->flags |= V4L2_FMT_FLAG_CSC_QUANTIZATION;
+	}
 
 	return 0;
 }
@@ -853,8 +907,13 @@ static int ax_vin_enum_fmt(struct file *file, void *priv,
 static int ax_vin_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct ax_vin *vin = video_drvdata(file);
+	struct v4l2_subdev_format fmt = { .which = V4L2_SUBDEV_FORMAT_ACTIVE };
 
 	f->fmt.pix = vin->fmt;
+	/* The source's colour follows its input. */
+	if (vin->source &&
+	    !v4l2_subdev_call_state_active(vin->source, pad, get_fmt, &fmt))
+		ax_vin_copy_colour(&f->fmt.pix, &fmt.format);
 
 	return 0;
 }
@@ -862,7 +921,10 @@ static int ax_vin_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 static int ax_vin_try_fmt(struct file *file, void *priv,
 			  struct v4l2_format *f)
 {
+	struct ax_vin *vin = video_drvdata(file);
+
 	ax_vin_fill_fmt(&f->fmt.pix);
+	ax_vin_colour(vin, &f->fmt.pix, V4L2_SUBDEV_FORMAT_TRY);
 
 	return 0;
 }
@@ -870,12 +932,16 @@ static int ax_vin_try_fmt(struct file *file, void *priv,
 static int ax_vin_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct ax_vin *vin = video_drvdata(file);
+	struct v4l2_pix_format *pix = &f->fmt.pix;
 
-	if (vb2_is_busy(&vin->queue))
+	ax_vin_fill_fmt(pix);
+	/* With the buffers allocated only the colour may change. */
+	if (vb2_is_busy(&vin->queue) &&
+	    (pix->width != vin->fmt.width || pix->height != vin->fmt.height))
 		return -EBUSY;
 
-	ax_vin_fill_fmt(&f->fmt.pix);
-	vin->fmt = f->fmt.pix;
+	ax_vin_colour(vin, pix, V4L2_SUBDEV_FORMAT_ACTIVE);
+	vin->fmt = *pix;
 
 	return 0;
 }
@@ -1234,6 +1300,7 @@ static int ax_vin_probe(struct platform_device *pdev)
 
 	vin->fmt.width = AX_VIN_MAX_WIDTH;
 	vin->fmt.height = AX_VIN_MAX_HEIGHT;
+	vin->fmt.colorspace = V4L2_COLORSPACE_REC709;
 	ax_vin_fill_fmt(&vin->fmt);
 
 	vin->v4l2_dev.notify = ax_vin_notify;
