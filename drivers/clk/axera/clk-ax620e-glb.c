@@ -20,6 +20,7 @@
 #include <linux/reset-controller.h>
 
 #include <dt-bindings/clock/axera,ax620e-comm-glb.h>
+#include <dt-bindings/clock/axera,ax620e-cpu-sys.h>
 #include <dt-bindings/clock/axera,ax620e-flash-sys.h>
 #include <dt-bindings/clock/axera,ax620e-periph-sys.h>
 #include <dt-bindings/clock/axera,ax620e-vpu-sys.h>
@@ -39,6 +40,8 @@ struct ax620e_glb_mux {
 	u16 reg;
 	u8 shift;
 	u8 width;
+	/* clk_set_rate() picks the parent, as cpufreq needs for the CPU's */
+	bool reparent;
 };
 
 /* Divides by field + 1; a new value takes effect on a pulse of update_bit. */
@@ -82,10 +85,13 @@ struct ax620e_glb_data {
 	unsigned int num_clks;
 	/* Offset of the I2S routing register, 0 for none. */
 	u16 audio_routing;
+	/* No set and clear registers: muxes are read, changed and written. */
+	bool rmw;
 };
 
 struct ax620e_glb {
 	void __iomem *base;
+	spinlock_t lock;
 	const struct ax620e_glb_data *data;
 	struct reset_controller_dev rcdev;
 };
@@ -154,6 +160,17 @@ static u8 ax620e_glb_mux_get_parent(struct clk_hw *hw)
 static int ax620e_glb_mux_set_parent(struct clk_hw *hw, u8 index)
 {
 	struct ax620e_glb_clk *clk = to_ax620e_glb_clk(hw);
+	unsigned long flags;
+	u32 val;
+
+	/* One write: a clear first would pass through parent 0. */
+	if (clk->glb->data->rmw) {
+		spin_lock_irqsave(&clk->glb->lock, flags);
+		val = readl(clk->glb->base + clk->reg) & ~clk->mask;
+		writel(val | index << clk->shift, clk->glb->base + clk->reg);
+		spin_unlock_irqrestore(&clk->glb->lock, flags);
+		return 0;
+	}
 
 	writel(clk->mask, ax620e_glb_clr(clk->glb, clk->reg));
 	writel(index << clk->shift, ax620e_glb_set(clk->glb, clk->reg));
@@ -293,6 +310,7 @@ static int ax620e_glb_probe(struct platform_device *pdev)
 	if (!glb)
 		return -ENOMEM;
 	glb->data = data;
+	spin_lock_init(&glb->lock);
 
 	glb->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(glb->base))
@@ -337,7 +355,7 @@ static int ax620e_glb_probe(struct platform_device *pdev)
 		init.ops = &ax620e_glb_mux_ops;
 		init.parent_data = parents;
 		init.num_parents = mux->num_parents;
-		init.flags = CLK_SET_RATE_NO_REPARENT;
+		init.flags = mux->reparent ? 0 : CLK_SET_RATE_NO_REPARENT;
 		hw = ax620e_glb_register(dev, &tmpl, &init);
 		if (IS_ERR(hw))
 			return PTR_ERR(hw);
@@ -642,8 +660,25 @@ static const struct ax620e_glb_data ax620e_comm_glb_data = {
 	.num_clks = AX620E_COMM_CLK_THM + 1,
 };
 
+/* The CPUs' clock: fixed PLL outputs, which cpufreq switches between. */
+static const char * const cpu_parents[] = {
+	"cpll_24m", "cpll_208m", "epll_500m", "npll_800m", "cpupll_1200m",
+};
+
+static const struct ax620e_glb_mux cpu_muxes[] = {
+	{ AX620E_CPU_CLK_SEL, "cpu_sel", cpu_parents, 5, 0x0, 2, 3, true },
+};
+
+static const struct ax620e_glb_data ax620e_cpu_sys_data = {
+	.muxes = cpu_muxes,
+	.num_muxes = ARRAY_SIZE(cpu_muxes),
+	.num_clks = AX620E_CPU_CLK_SEL + 1,
+	.rmw = true,
+};
+
 static const struct of_device_id ax620e_glb_of_match[] = {
 	{ .compatible = "axera,ax620e-comm-glb", .data = &ax620e_comm_glb_data },
+	{ .compatible = "axera,ax620e-cpu-sys", .data = &ax620e_cpu_sys_data },
 	{ .compatible = "axera,ax620e-flash-sys", .data = &ax620e_flash_sys_data },
 	{ .compatible = "axera,ax620e-periph-sys", .data = &ax620e_periph_sys_data },
 	{ .compatible = "axera,ax620e-vpu-sys", .data = &ax620e_vpu_sys_data },
