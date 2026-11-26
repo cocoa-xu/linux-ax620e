@@ -7,6 +7,7 @@
 /dts-v1/;
 
 #include <dt-bindings/clock/axera,ax620e-comm-glb.h>
+#include <dt-bindings/clock/axera,ax620e-cpu-sys.h>
 #include <dt-bindings/clock/axera,ax620e-flash-sys.h>
 #include <dt-bindings/clock/axera,ax620e-periph-sys.h>
 #include <dt-bindings/clock/axera,ax620e-vpu-sys.h>
@@ -43,6 +44,8 @@
 			compatible = "arm,cortex-a53";
 			reg = <0>;
 			enable-method = "axera,ax620e-smp";
+			clocks = <&cpu_sys AX620E_CPU_CLK_SEL>;
+			operating-points-v2 = <&cpu_opp_table>;
 		};
 
 		cpu@1 {
@@ -50,6 +53,37 @@
 			compatible = "arm,cortex-a53";
 			reg = <1>;
 			enable-method = "axera,ax620e-smp";
+			clocks = <&cpu_sys AX620E_CPU_CLK_SEL>;
+			operating-points-v2 = <&cpu_opp_table>;
+		};
+	};
+
+	/*
+	 * The CPUs' clock switches between fixed PLL outputs, at the voltage the
+	 * board gives the cores at 1.2 GHz. The vendor's table also has 24 MHz.
+	 */
+	cpu_opp_table: opp-table-cpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-208000000 {
+			opp-hz = /bits/ 64 <208000000>;
+			clock-latency-ns = <50000>;
+		};
+
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			clock-latency-ns = <50000>;
+		};
+
+		opp-800000000 {
+			opp-hz = /bits/ 64 <800000000>;
+			clock-latency-ns = <50000>;
+		};
+
+		opp-1200000000 {
+			opp-hz = /bits/ 64 <1200000000>;
+			clock-latency-ns = <50000>;
 		};
 	};
 
@@ -220,6 +254,20 @@
 		#clock-cells = <0>;
 		clock-frequency = <500000000>;
 		clock-output-names = "epll_500m";
+	};
+
+	npll_800m: clock-800000000 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <800000000>;
+		clock-output-names = "npll_800m";
+	};
+
+	cpupll_1200m: clock-1200000000 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <1200000000>;
+		clock-output-names = "cpupll_1200m";
 	};
 
 	npll_533m: clock-533333333 {
@@ -513,6 +561,16 @@
 				 <&periph_sys AX620E_PERIPH_CLK_WDT0>;
 			clock-names = "pclk", "wdt";
 			resets = <&periph_sys AX620E_PERIPH_RST_WDT0>;
+		};
+
+		cpu_sys: clock-controller@1900000 {
+			compatible = "axera,ax620e-cpu-sys";
+			reg = <0x01900000 0x1000>;
+			clocks = <&cpll_24m>, <&cpll_208m>, <&epll_500m>, <&npll_800m>,
+				 <&cpupll_1200m>;
+			clock-names = "cpll_24m", "cpll_208m", "epll_500m", "npll_800m",
+				      "cpupll_1200m";
+			#clock-cells = <1>;
 		};
 
 		periph_sys: clock-controller@4870000 {
