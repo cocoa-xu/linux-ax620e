@@ -60,13 +60,16 @@
 
 	/*
 	 * The CPUs' clock switches between fixed PLL outputs, at the voltage the
-	 * board gives the cores at 1.2 GHz. Not below their bus clock
-	 * (aclk_cpu_top, 416 MHz from the boot firmware): at 208 MHz the cores
-	 * hang, though the vendor's table has it and 24 MHz.
+	 * board gives the cores at 1.2 GHz. The vendor's table also has 24 MHz.
 	 */
 	cpu_opp_table: opp-table-cpu {
 		compatible = "operating-points-v2";
 		opp-shared;
+
+		opp-208000000 {
+			opp-hz = /bits/ 64 <208000000>;
+			clock-latency-ns = <50000>;
+		};
 
 		opp-500000000 {
 			opp-hz = /bits/ 64 <500000000>;
