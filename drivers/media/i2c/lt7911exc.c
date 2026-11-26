@@ -6,13 +6,17 @@
  * link, converts the video to CSI-2 YUV422 8-bit and reports the detected
  * timings and the audio sample rate through a register page. The host reads
  * that page on the interrupt the firmware raises when the video or the
- * audio appears or disappears.
+ * audio appears or disappears. The firmware turns an RGB source into BT.709
+ * at full range; the host may ask for BT.601 or the limited range instead
+ * (V4L2_MBUS_FRAMEFMT_SET_CSC), which the driver sets again after every
+ * new input.
  *
  * The EDID the bridge presents to the source is kept in the same SPI flash
  * as the firmware, in a 64 KiB block of its own, which the host reaches
  * through a flash controller on the same register page.
  */
 
+#include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
@@ -73,6 +77,14 @@
  */
 #define REG_HOST_ACCESS			CCI_REG8(0xe0ee)
 
+/*
+ * The converter from the source's RGB to YCbCr, which the firmware sets up
+ * for every new input and leaves disabled when the source sends YCbCr.
+ */
+#define REG_CSC				CCI_REG8(0xc50c)
+#define  CSC_MODE			GENMASK(7, 4)
+#define  CSC_ENABLE			BIT(0)
+
 #define SPI_NOR_WREN			0x06
 #define SPI_NOR_READ			0x03
 #define SPI_NOR_BLOCK_ERASE		0xd8	/* 64 KiB */
@@ -96,6 +108,26 @@ static const struct v4l2_dv_timings_cap lt7911exc_timings_cap = {
 			     V4L2_DV_BT_CAP_PROGRESSIVE |
 			     V4L2_DV_BT_CAP_CUSTOM |
 			     V4L2_DV_BT_CAP_REDUCED_BLANKING)
+};
+
+struct lt7911exc_csc {
+	enum v4l2_ycbcr_encoding ycbcr_enc;
+	bool full_in;
+	bool full_out;
+};
+
+/* The CSC modes the firmware knows, by REG_CSC's mode field. */
+static const struct lt7911exc_csc lt7911exc_csc_modes[] = {
+	[0x0] = { V4L2_YCBCR_ENC_601, false, false },
+	[0x1] = { V4L2_YCBCR_ENC_601, false, true },
+	[0x2] = { V4L2_YCBCR_ENC_709, false, false },
+	[0x3] = { V4L2_YCBCR_ENC_709, false, true },
+	[0x4] = { V4L2_YCBCR_ENC_BT2020, false, true },
+	[0x6] = { V4L2_YCBCR_ENC_601, true, false },
+	[0x7] = { V4L2_YCBCR_ENC_601, true, true },
+	[0x8] = { V4L2_YCBCR_ENC_709, true, false },
+	[0x9] = { V4L2_YCBCR_ENC_709, true, true },
+	[0xa] = { V4L2_YCBCR_ENC_BT2020, true, true },
 };
 
 static const struct regmap_range_cfg lt7911exc_ranges[] = {
@@ -154,6 +186,16 @@ struct lt7911exc {
 	/* Detected input timings; zero width when there is no signal. */
 	struct v4l2_dv_timings detected;
 	struct v4l2_dv_timings timings;
+	/*
+	 * The CSC modes the firmware set for the input and the one in effect,
+	 * -1 when the bridge converts nothing; the encoding and the range
+	 * asked for, *_DEFAULT for the firmware's. Protected by the active
+	 * state's lock.
+	 */
+	int fw_csc;
+	int csc;
+	enum v4l2_ycbcr_encoding ycbcr_enc;
+	enum v4l2_quantization quantization;
 
 	/* Serializes the host's register accesses and protects the EDID copy. */
 	struct mutex access_lock;
@@ -509,7 +551,74 @@ static int lt7911exc_set_edid(struct v4l2_subdev *sd, struct v4l2_edid *edid)
 	return ret;
 }
 
-static void lt7911exc_fill_format(struct lt7911exc *lt,
+/* The CSC mode the bridge uses, -1 when it converts nothing. */
+static int lt7911exc_read_csc(struct lt7911exc *lt)
+{
+	u64 val = 0;
+	int ret = 0;
+
+	mutex_lock(&lt->access_lock);
+	cci_write(lt->regmap, REG_HOST_ACCESS, 1, &ret);
+	cci_read(lt->regmap, REG_CSC, &val, &ret);
+	ret = lt7911exc_end_host_access(lt, ret);
+	mutex_unlock(&lt->access_lock);
+
+	if (ret || !(val & CSC_ENABLE) ||
+	    FIELD_GET(CSC_MODE, val) >= ARRAY_SIZE(lt7911exc_csc_modes) ||
+	    !lt7911exc_csc_modes[FIELD_GET(CSC_MODE, val)].ycbcr_enc)
+		return -1;
+
+	return FIELD_GET(CSC_MODE, val);
+}
+
+/* The firmware's CSC mode with the encoding and the range out changed. */
+static int lt7911exc_wanted_csc(struct lt7911exc *lt,
+				enum v4l2_ycbcr_encoding ycbcr_enc,
+				enum v4l2_quantization quantization)
+{
+	const struct lt7911exc_csc *fw;
+	unsigned int i;
+	bool full_out;
+
+	if (lt->fw_csc < 0)
+		return -1;
+
+	fw = &lt7911exc_csc_modes[lt->fw_csc];
+	if (ycbcr_enc == V4L2_YCBCR_ENC_DEFAULT)
+		ycbcr_enc = fw->ycbcr_enc;
+	full_out = quantization == V4L2_QUANTIZATION_DEFAULT ? fw->full_out :
+		   quantization == V4L2_QUANTIZATION_FULL_RANGE;
+
+	for (i = 0; i < ARRAY_SIZE(lt7911exc_csc_modes); i++)
+		if (lt7911exc_csc_modes[i].ycbcr_enc == ycbcr_enc &&
+		    lt7911exc_csc_modes[i].full_in == fw->full_in &&
+		    lt7911exc_csc_modes[i].full_out == full_out)
+			return i;
+
+	return lt->fw_csc;
+}
+
+static void lt7911exc_set_csc(struct lt7911exc *lt, int csc)
+{
+	int ret = 0;
+
+	if (csc < 0 || csc == lt->csc)
+		return;
+
+	mutex_lock(&lt->access_lock);
+	cci_write(lt->regmap, REG_HOST_ACCESS, 1, &ret);
+	cci_update_bits(lt->regmap, REG_CSC, CSC_MODE,
+			FIELD_PREP(CSC_MODE, csc), &ret);
+	ret = lt7911exc_end_host_access(lt, ret);
+	mutex_unlock(&lt->access_lock);
+
+	if (ret)
+		dev_err(lt->sd.dev, "failed to set the CSC: %d\n", ret);
+	else
+		lt->csc = csc;
+}
+
+static void lt7911exc_fill_format(struct lt7911exc *lt, int csc,
 				  struct v4l2_mbus_framefmt *fmt)
 {
 	fmt->width = lt->detected.bt.width;
@@ -517,6 +626,28 @@ static void lt7911exc_fill_format(struct lt7911exc *lt,
 	fmt->code = MEDIA_BUS_FMT_UYVY8_1X16;
 	fmt->field = V4L2_FIELD_NONE;
 	fmt->colorspace = V4L2_COLORSPACE_REC709;
+	fmt->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+	if (csc < 0) {
+		/* The source's own YCbCr, which the bridge does not describe. */
+		fmt->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+		fmt->quantization = V4L2_QUANTIZATION_DEFAULT;
+	} else {
+		fmt->ycbcr_enc = lt7911exc_csc_modes[csc].ycbcr_enc;
+		fmt->quantization = lt7911exc_csc_modes[csc].full_out ?
+				    V4L2_QUANTIZATION_FULL_RANGE :
+				    V4L2_QUANTIZATION_LIM_RANGE;
+	}
+}
+
+/* Stores the format of the input and the CSC mode in effect. */
+static void lt7911exc_refresh(struct lt7911exc *lt,
+			      struct v4l2_subdev_state *state)
+{
+	s64 rate = lt7911exc_pixel_rate(&lt->detected.bt);
+
+	lt7911exc_fill_format(lt, lt->csc,
+			      v4l2_subdev_state_get_format(state, 0));
+	__v4l2_ctrl_modify_range(lt->pixel_rate, rate, rate, 1, rate);
 }
 
 static int lt7911exc_set_format(struct v4l2_subdev *sd,
@@ -524,15 +655,31 @@ static int lt7911exc_set_format(struct v4l2_subdev *sd,
 				struct v4l2_subdev_format *fmt)
 {
 	struct lt7911exc *lt = to_lt7911exc(sd);
-	s64 rate;
+	enum v4l2_ycbcr_encoding ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	enum v4l2_quantization quantization = V4L2_QUANTIZATION_DEFAULT;
+	int csc;
 
-	lt7911exc_fill_format(lt, &fmt->format);
-	*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
-	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
+	if (fmt->format.flags & V4L2_MBUS_FRAMEFMT_SET_CSC) {
+		if (fmt->format.ycbcr_enc == V4L2_YCBCR_ENC_601 ||
+		    fmt->format.ycbcr_enc == V4L2_YCBCR_ENC_709)
+			ycbcr_enc = fmt->format.ycbcr_enc;
+		if (fmt->format.quantization == V4L2_QUANTIZATION_FULL_RANGE ||
+		    fmt->format.quantization == V4L2_QUANTIZATION_LIM_RANGE)
+			quantization = fmt->format.quantization;
+	}
+
+	csc = lt7911exc_wanted_csc(lt, ycbcr_enc, quantization);
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		lt7911exc_fill_format(lt, csc, &fmt->format);
+		*v4l2_subdev_state_get_format(state, fmt->pad) = fmt->format;
 		return 0;
+	}
 
-	rate = lt7911exc_pixel_rate(&lt->detected.bt);
-	__v4l2_ctrl_modify_range(lt->pixel_rate, rate, rate, 1, rate);
+	lt->ycbcr_enc = ycbcr_enc;
+	lt->quantization = quantization;
+	lt7911exc_set_csc(lt, csc);
+	lt7911exc_refresh(lt, state);
+	lt7911exc_fill_format(lt, lt->csc, &fmt->format);
 
 	return 0;
 }
@@ -545,6 +692,8 @@ static int lt7911exc_enum_mbus_code(struct v4l2_subdev *sd,
 		return -EINVAL;
 
 	code->code = MEDIA_BUS_FMT_UYVY8_1X16;
+	code->flags = V4L2_SUBDEV_MBUS_CODE_CSC_YCBCR_ENC |
+		      V4L2_SUBDEV_MBUS_CODE_CSC_QUANTIZATION;
 
 	return 0;
 }
@@ -690,15 +839,25 @@ static const struct media_entity_operations lt7911exc_entity_ops = {
 	.link_validate = v4l2_subdev_link_validate,
 };
 
+/* Reads the CSC mode the firmware set up for a new input. */
+static void lt7911exc_read_fw_csc(struct lt7911exc *lt)
+{
+	lt->fw_csc = lt->detected.bt.width ? lt7911exc_read_csc(lt) : -1;
+	lt->csc = lt->fw_csc;
+}
+
 static void lt7911exc_update(struct lt7911exc *lt)
 {
-	struct v4l2_subdev_format fmt = { .which = V4L2_SUBDEV_FORMAT_ACTIVE };
 	struct v4l2_subdev_state *state;
 
 	state = v4l2_subdev_lock_and_get_active_state(&lt->sd);
 	lt7911exc_read_timings(lt);
 	lt->timings = lt->detected;
-	lt7911exc_set_format(&lt->sd, state, &fmt);
+	/* The firmware set the CSC up before it raised the interrupt. */
+	lt7911exc_read_fw_csc(lt);
+	lt7911exc_set_csc(lt, lt7911exc_wanted_csc(lt, lt->ycbcr_enc,
+						   lt->quantization));
+	lt7911exc_refresh(lt, state);
 	v4l2_subdev_unlock_state(state);
 
 	dev_info(lt->sd.dev, "input %ux%u@%u\n", lt->detected.bt.width,
@@ -835,6 +994,7 @@ static int lt7911exc_probe(struct i2c_client *client)
 
 	lt7911exc_read_timings(lt);
 	lt->timings = lt->detected;
+	lt7911exc_read_fw_csc(lt);
 
 	ret = lt7911exc_init_controls(lt);
 	if (ret)
