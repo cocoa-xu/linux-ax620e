@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Sipeed NanoKVM-Go in AArch64: the board as in AArch32, with TF-A's BL31
+ * starting the second core through PSCI and keeping its own memory.
+ */
+
+#include "arm/axera/ax620qe-nanokvm-go.dts"
+
+/ {
+	psci {
+		compatible = "arm,psci-1.0";
+		method = "smc";
+	};
+
+	reserved-memory {
+		bl31@40040000 {
+			reg = <0x40040000 0x40000>;
+			no-map;
+		};
+	};
+};
+
+&{/cpus/cpu@0} {
+	enable-method = "psci";
+};
+
+&{/cpus/cpu@1} {
+	enable-method = "psci";
+};
