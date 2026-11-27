@@ -27,3 +27,8 @@
 &{/cpus/cpu@1} {
 	enable-method = "psci";
 };
+
+/* Linux runs in the normal world here, with the timer set up by TF-A. */
+&{/timer} {
+	/delete-property/ arm,cpu-registers-not-fw-configured;
+};
