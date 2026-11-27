@@ -25,9 +25,7 @@
 #include "rwnx_compat.h"
 #include "aicwf_txrxif.h"
 #include "rwnx_msg_rx.h"
-#ifdef CONFIG_SDIO_BT
-#include "aic_btsdio.h"
-#endif
+#include "aicwf_bt.h"
 void rwnx_cfg80211_unlink_bss(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif);
 
 static int rwnx_freq_to_idx(struct rwnx_hw *rwnx_hw, int freq)
@@ -468,14 +466,14 @@ static inline int rwnx_apm_staloss_ind(struct rwnx_hw *rwnx_hw,
     return 0;
 }
 
-#ifdef CONFIG_SDIO_BT
+#ifdef CONFIG_AIC8800_BT
 static inline int rwnx_bt_recv_ind(struct rwnx_hw *rwnx_hw,
                                                 struct rwnx_cmd *cmd,
                                                 struct ipc_e2a_msg *msg)
 {
 	struct mm_bt_recv_ind *ind = (struct mm_bt_recv_ind *)msg->param;
 
-	bt_sdio_recv(ind->bt_data,ind->data_len);
+	aicwf_bt_recv(rwnx_hw, ind->bt_data, ind->data_len);
 	return 0;
 }
 #endif
@@ -1550,7 +1548,7 @@ static msg_cb_fct tdls_hdlrs[MSG_I(TDLS_MAX)] = {
 	[MSG_I(TDLS_CHAN_SWITCH_IND)] = rwnx_rx_tdls_chan_switch_ind,
 	[MSG_I(TDLS_CHAN_SWITCH_BASE_IND)] = rwnx_rx_tdls_chan_switch_base_ind,
 	[MSG_I(TDLS_PEER_PS_IND)] = rwnx_rx_tdls_peer_ps_ind,
-#ifdef CONFIG_SDIO_BT
+#ifdef CONFIG_AIC8800_BT
 	[MSG_I(TDLS_SDIO_BT_RECV_IND)]	= rwnx_bt_recv_ind,
 #endif
 };

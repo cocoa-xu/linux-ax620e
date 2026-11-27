@@ -194,8 +194,8 @@ int rwnx_send_set_apf_prog_req(struct rwnx_hw *rwnx_hw, u8_l *program, u32_l pro
 int rwnx_send_get_apf_prog_req(struct rwnx_hw *rwnx_hw, u8_l *program, u32_l program_len);
 #endif
 
-#ifdef CONFIG_SDIO_BT
-int rwnx_sdio_bt_send_req(struct rwnx_hw *rwnx_hw,uint32_t len, struct sk_buff *skb);
+#ifdef CONFIG_AIC8800_BT
+int rwnx_sdio_bt_send_req(struct rwnx_hw *rwnx_hw, u8 type, const void *data, u32 len);
 #endif
 
 #endif /* _RWNX_MSG_TX_H_ */

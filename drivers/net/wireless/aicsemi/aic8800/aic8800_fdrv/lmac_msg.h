@@ -1992,7 +1992,7 @@ struct fw_assert_info_ind
     uint8_t info[384];
 };
 
-#ifdef CONFIG_SDIO_BT
+#ifdef CONFIG_AIC8800_BT
 struct mm_bt_recv_ind
 {
 	u32_l data_len;
@@ -2251,7 +2251,7 @@ struct mm_set_vendor_swconfig_cfm
     };
 };
 
-#ifdef CONFIG_SDIO_BT
+#ifdef CONFIG_AIC8800_BT
 struct mm_bt_send_req
 {
 	u32_l data_len;
@@ -3174,7 +3174,7 @@ enum tdls_msg_tag {
 	/// TDLS peer traffic indication confirmation.
 	TDLS_PEER_TRAFFIC_IND_CFM,
 
-#ifdef CONFIG_SDIO_BT
+#ifdef CONFIG_AIC8800_BT
 	TDLS_SDIO_BT_SEND_REQ =  LMAC_FIRST_MSG(TASK_TDLS)+16,
 	TDLS_SDIO_BT_SEND_CFM,
 	TDLS_SDIO_BT_RECV_IND,

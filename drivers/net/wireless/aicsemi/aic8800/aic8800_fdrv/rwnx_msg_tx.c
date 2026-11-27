@@ -1761,33 +1761,26 @@ int rwnx_send_mask_set_ext_flags_req(struct rwnx_hw *rwnx_hw, uint32_t flags_mas
     return ret;
 }
 
-#ifdef CONFIG_SDIO_BT
-int rwnx_sdio_bt_send_req(struct rwnx_hw *rwnx_hw,uint32_t len, struct sk_buff *skb)
+#ifdef CONFIG_AIC8800_BT
+/* One H4 packet: its type, then the HCI packet. */
+int rwnx_sdio_bt_send_req(struct rwnx_hw *rwnx_hw, u8 type, const void *data, u32 len)
 {
 	struct mm_bt_send_req *req;
-	struct mm_bt_send_cfm cfm;
-	int error;
+	struct mm_bt_send_cfm cfm = { 0 };
 
-	if(testmode) {
-		AICWFDBG(LOGERROR, "%s testmode can not send\n", __func__);
-		return 0;
-	}
-	cfm.status = 0;
-    req = rwnx_msg_zalloc(TDLS_SDIO_BT_SEND_REQ, TASK_TDLS, DRV_TASK_ID, sizeof(struct mm_bt_send_req));
+	if (len + 1 > sizeof(req->bt_data))
+		return -EMSGSIZE;
 
-    if (!req) {
+	req = rwnx_msg_zalloc(TDLS_SDIO_BT_SEND_REQ, TASK_TDLS, DRV_TASK_ID, sizeof(*req));
+	if (!req)
 		return -ENOMEM;
-    }
 
-	req->data_len = len;
-	memcpy(req->bt_data,skb->data,len);
+	req->data_len = len + 1;
+	req->bt_data[0] = type;
+	memcpy(req->bt_data + 1, data, len);
 
-	error = rwnx_send_msg(rwnx_hw, req, 1, TDLS_SDIO_BT_SEND_CFM, &cfm);
-	if(!cfm.status){
-		printk("bt send no cfm");
-	}
-
-	return error;
+	rwnx_send_msg(rwnx_hw, req, 1, TDLS_SDIO_BT_SEND_CFM, &cfm);
+	return cfm.status ? 0 : -EIO;
 }
 #endif
 

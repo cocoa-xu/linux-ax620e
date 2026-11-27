@@ -16,4 +16,13 @@ config AIC8800
 	  and aic8800_fdrv modules; firmware is read from the directory
 	  given by the aic8800_bsp aic_fw_path parameter.
 
+config AIC8800_BT
+	bool "AICSemi AIC8800 Bluetooth over SDIO"
+	depends on AIC8800 && BT
+	default y
+	help
+	  The AIC8800's Bluetooth controller as an HCI device. Its packets
+	  travel in the Wi-Fi firmware's SDIO messages (the fmacfwbt
+	  firmware), so the HCI device comes and goes with the Wi-Fi driver.
+
 endif

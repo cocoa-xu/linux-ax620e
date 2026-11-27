@@ -667,9 +667,12 @@ static const char *const s_conn_state[] = {
 };
 
 
+struct aicwf_bt;
+
 struct rwnx_hw {
 	struct rwnx_mod_params *mod_params;
 	struct device *dev;
+	struct aicwf_bt __rcu *bt;
 #ifdef AICWF_SDIO_SUPPORT
 	struct aic_sdio_dev *sdiodev;
 #endif

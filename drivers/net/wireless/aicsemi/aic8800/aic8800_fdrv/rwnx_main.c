@@ -52,9 +52,7 @@
 #include "aicwf_compat_8800dc.h"
 #include "aicwf_compat_8800d80.h"
 #include "rwnx_wakelock.h"
-#ifdef CONFIG_SDIO_BT
-#include "aic_btsdio.h"
-#endif
+#include "aicwf_bt.h"
 #include "aic_priv_cmd.h"
 #ifdef CONFIG_BAND_STEERING
 #include "aicwf_manager.h"
@@ -6160,14 +6158,11 @@ int rwnx_cfg80211_init(struct rwnx_plat *rwnx_plat, void **platform_data)
 	//wiphy_info(wiphy, "New interface create %s", vif->ndev->name);
 	AICWFDBG(LOGINFO, "New interface create %s \r\n", vif->ndev->name);
 
-#ifdef CONFIG_SDIO_BT
-#if CONFIG_BLUEDROID
-	btchr_init();
-	hdev_init();
-#else
-	btsdio_init();
-#endif
-#endif
+	if (IS_ENABLED(CONFIG_AIC8800_BT) && !testmode) {
+		ret = aicwf_bt_init(rwnx_hw);
+		if (ret)
+			wiphy_warn(wiphy, "no Bluetooth: %d\n", ret);
+	}
 
 #ifdef  CONFIG_USE_P2P0
 
@@ -6269,14 +6264,8 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 	rwnx_dbgfs_unregister(rwnx_hw);
 #endif
 
-#ifdef CONFIG_SDIO_BT
-#if CONFIG_BLUEDROID
-	btchr_exit();
-	hdev_exit();
-#else
-	btsdio_remove();
-#endif
-#endif
+	if (IS_ENABLED(CONFIG_AIC8800_BT))
+		aicwf_bt_deinit(rwnx_hw);
 
 	flush_workqueue(rwnx_hw->apmStaloss_wq);
 	destroy_workqueue(rwnx_hw->apmStaloss_wq);
