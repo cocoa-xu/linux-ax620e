@@ -23,6 +23,8 @@
 #include <asm/page.h>
 #include <asm/pgtable-prot.h>
 
+#define RAMLOG_PAGES		28
+
 /*
  * Here we define all the compile-time 'special' virtual
  * addresses. The point is to have a constant address at
@@ -46,6 +48,10 @@ enum fixed_addresses {
 	FIX_FDT = FIX_FDT_END + DIV_ROUND_UP(MAX_FDT_SIZE, PAGE_SIZE) + 1,
 
 	FIX_EARLYCON_MEM_BASE,
+#ifdef CONFIG_SERIAL_EARLYCON_RAMLOG
+	FIX_RAMLOG_BEGIN,
+	FIX_RAMLOG_END = FIX_RAMLOG_BEGIN + RAMLOG_PAGES - 1,
+#endif
 	FIX_TEXT_POKE0,
 
 #ifdef CONFIG_KVM

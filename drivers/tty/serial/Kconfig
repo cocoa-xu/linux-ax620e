@@ -75,7 +75,7 @@ config SERIAL_AMBA_PL011_CONSOLE
 
 config SERIAL_EARLYCON_RAMLOG
 	bool "Early console into a reserved RAM region"
-	depends on ARM && MMU
+	depends on (ARM || ARM64) && MMU
 	select SERIAL_CORE
 	select SERIAL_CORE_CONSOLE
 	select SERIAL_EARLYCON
