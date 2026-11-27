@@ -21,6 +21,7 @@
 
 #define AICWF_BT_MAX_SEND	sizeof_field(struct mm_bt_send_req, bt_data)
 #define AICWF_BT_MAX_RECV	sizeof_field(struct mm_bt_recv_ind, bt_data)
+#define AICWF_BT_MAX_ACL	(AICWF_BT_MAX_SEND - 1 - HCI_ACL_HDR_SIZE)
 
 struct aicwf_bt {
 	struct rwnx_hw *rwnx_hw;
@@ -109,6 +110,29 @@ static int aicwf_bt_send(struct hci_dev *hdev, struct sk_buff *skb)
 	return 0;
 }
 
+/*
+ * The controller takes ACL packets of 1021 bytes, a message carries 1019 of
+ * them: the stack learns the length that fits and fragments to it.
+ */
+static void aicwf_bt_fixup(struct sk_buff *skb)
+{
+	struct hci_rp_read_buffer_size *rp;
+	struct hci_ev_cmd_complete *cc;
+
+	if (hci_skb_pkt_type(skb) != HCI_EVENT_PKT ||
+	    skb->len < HCI_EVENT_HDR_SIZE + sizeof(*cc) + sizeof(*rp) ||
+	    hci_event_hdr(skb)->evt != HCI_EV_CMD_COMPLETE)
+		return;
+
+	cc = (void *)(skb->data + HCI_EVENT_HDR_SIZE);
+	if (__le16_to_cpu(cc->opcode) != HCI_OP_READ_BUFFER_SIZE)
+		return;
+
+	rp = (void *)(cc + 1);
+	if (!rp->status && __le16_to_cpu(rp->acl_mtu) > AICWF_BT_MAX_ACL)
+		rp->acl_mtu = cpu_to_le16(AICWF_BT_MAX_ACL);
+}
+
 /* Called from the message path, which may not sleep. */
 void aicwf_bt_recv(struct rwnx_hw *rwnx_hw, const u8 *data, u32 len)
 {
@@ -133,6 +157,7 @@ void aicwf_bt_recv(struct rwnx_hw *rwnx_hw, const u8 *data, u32 len)
 
 	hci_skb_pkt_type(skb) = data[0];
 	skb_put_data(skb, data + 1, len - 1);
+	aicwf_bt_fixup(skb);
 	bt->hdev->stat.byte_rx += len - 1;
 	hci_recv_frame(bt->hdev, skb);
 out:
