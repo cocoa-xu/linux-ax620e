@@ -187,10 +187,9 @@ struct lt7911exc {
 	struct v4l2_dv_timings detected;
 	struct v4l2_dv_timings timings;
 	/*
-	 * The CSC modes the firmware set for the input and the one in effect,
-	 * -1 when the bridge converts nothing; the encoding and the range
-	 * asked for, *_DEFAULT for the firmware's. Protected by the active
-	 * state's lock.
+	 * The CSC mode found for the input and the one in effect, -1 when the
+	 * bridge converts nothing; the encoding and the range asked for,
+	 * *_DEFAULT for the firmware's. Protected by the active state's lock.
 	 */
 	int fw_csc;
 	int csc;
@@ -571,27 +570,29 @@ static int lt7911exc_read_csc(struct lt7911exc *lt)
 	return FIELD_GET(CSC_MODE, val);
 }
 
-/* The firmware's CSC mode with the encoding and the range out changed. */
+/*
+ * The CSC mode for the encoding and the range out asked for, the range in
+ * being the firmware's, which follows the source. The firmware's own choice
+ * is BT.709 at full range; the bridge outlives the host, so its register may
+ * hold what an earlier one asked for instead.
+ */
 static int lt7911exc_wanted_csc(struct lt7911exc *lt,
 				enum v4l2_ycbcr_encoding ycbcr_enc,
 				enum v4l2_quantization quantization)
 {
-	const struct lt7911exc_csc *fw;
+	bool full_in, full_out = quantization != V4L2_QUANTIZATION_LIM_RANGE;
 	unsigned int i;
-	bool full_out;
 
 	if (lt->fw_csc < 0)
 		return -1;
 
-	fw = &lt7911exc_csc_modes[lt->fw_csc];
+	full_in = lt7911exc_csc_modes[lt->fw_csc].full_in;
 	if (ycbcr_enc == V4L2_YCBCR_ENC_DEFAULT)
-		ycbcr_enc = fw->ycbcr_enc;
-	full_out = quantization == V4L2_QUANTIZATION_DEFAULT ? fw->full_out :
-		   quantization == V4L2_QUANTIZATION_FULL_RANGE;
+		ycbcr_enc = V4L2_YCBCR_ENC_709;
 
 	for (i = 0; i < ARRAY_SIZE(lt7911exc_csc_modes); i++)
 		if (lt7911exc_csc_modes[i].ycbcr_enc == ycbcr_enc &&
-		    lt7911exc_csc_modes[i].full_in == fw->full_in &&
+		    lt7911exc_csc_modes[i].full_in == full_in &&
 		    lt7911exc_csc_modes[i].full_out == full_out)
 			return i;
 
@@ -995,6 +996,8 @@ static int lt7911exc_probe(struct i2c_client *client)
 	lt7911exc_read_timings(lt);
 	lt->timings = lt->detected;
 	lt7911exc_read_fw_csc(lt);
+	lt7911exc_set_csc(lt, lt7911exc_wanted_csc(lt, lt->ycbcr_enc,
+						   lt->quantization));
 
 	ret = lt7911exc_init_controls(lt);
 	if (ret)
